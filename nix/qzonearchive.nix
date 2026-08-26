@@ -20,7 +20,7 @@ rustPlatform.buildRustPackage {
   npmDeps = pkgs.fetchNpmDeps {
     name = "qzonearchive-1.0.7-npm-deps";
     src = lib.cleanSource ../.;
-    hash = "sha256-EPF2SFBAydwBWvoAGcj2p0BuwMVPiAJY5THv298dUDk=";
+    hash = "sha256-CPMW3gOGjqhuDie3/cDqeuwJFVgcN+QeCDi9Vm07TjY=";
   };
 
   nativeBuildInputs = [
