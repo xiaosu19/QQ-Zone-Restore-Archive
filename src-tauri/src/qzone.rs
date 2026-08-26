@@ -1453,11 +1453,12 @@ fn history_mood_cell_id(card_body: &str, owner_uin: &str) -> Option<String> {
         r#"(?i)(?:https?:)?//user\.qzone\.qq\.com/(\d+)/mood/([^?&"'<>/\s]+)"#,
     )
     .expect("fixed Qzone mood URL regex");
-    pattern.captures_iter(card_body).find_map(|captures| {
+    let cell_id = pattern.captures_iter(card_body).find_map(|captures| {
         (captures.get(1)?.as_str() == owner_uin)
             .then(|| captures.get(2).map(|value| value.as_str().to_owned()))
             .flatten()
-    })
+    });
+    cell_id
 }
 
 fn history_original_content(content: &str, owner_name: Option<&str>) -> Option<String> {
