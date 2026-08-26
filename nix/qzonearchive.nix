@@ -15,7 +15,7 @@ rustPlatform.buildRustPackage {
   cargoRoot = "src-tauri";
   buildAndTestSubdir = "src-tauri";
 
-  cargoHash = "sha256-o+knfzykPClG6ici0QX1DFbPaChKTknfrt7RZ+bw2SA=";
+  cargoHash = "sha256-QLfHKVbJVcnIBZRPpa+FAheFa/XPNbmLV/KuApIvHvM=";
 
   npmDeps = pkgs.fetchNpmDeps {
     name = "qzonearchive-1.0.7-npm-deps";
