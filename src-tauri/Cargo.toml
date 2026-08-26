@@ -1,6 +1,6 @@
 [package]
 name = "qzonearchive"
-version = "1.0.6"
+version = "1.0.7"
 description = "将 QQ 空间动态、照片、视频与互动记录安全归档到本地"
 authors = ["https://github.com/xiaosu19"]
 edition = "2021"

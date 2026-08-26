@@ -305,6 +305,10 @@ fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
            window_started_at INTEGER NOT NULL,
            requested_pages INTEGER NOT NULL DEFAULT 0
          );
+         CREATE TABLE IF NOT EXISTS archive_migrations (
+           name TEXT PRIMARY KEY,
+           applied_at INTEGER NOT NULL
+         );
          CREATE TABLE IF NOT EXISTS archive_skips (
            id INTEGER PRIMARY KEY AUTOINCREMENT,
            owner_uin TEXT NOT NULL,
@@ -349,7 +353,46 @@ fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
     }
     migrate_legacy_dynamics(&mut connection)?;
     migrate_dynamic_categories(&mut connection)?;
+    migrate_history_v1_records(&mut connection)?;
     Ok(connection)
+}
+
+fn migrate_history_v1_records(connection: &mut Connection) -> Result<(), String> {
+    let applied = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM archive_migrations WHERE name='history-parser-v2')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查旧历史数据清理状态失败：{error}"))?;
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("开始清理旧历史解析数据失败：{error}"))?;
+    transaction
+        .execute(
+            "DELETE FROM archive_feeds WHERE feed_key LIKE 'history-html:%'",
+            [],
+        )
+        .map_err(|error| format!("清理旧历史事件失败：{error}"))?;
+    transaction
+        .execute(
+            "DELETE FROM archive_dynamics WHERE cell_id LIKE 'history-html:%'",
+            [],
+        )
+        .map_err(|error| format!("清理旧历史动态失败：{error}"))?;
+    transaction
+        .execute(
+            "INSERT INTO archive_migrations(name,applied_at) VALUES ('history-parser-v2',?1)",
+            params![now()],
+        )
+        .map_err(|error| format!("记录旧历史数据清理状态失败：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交旧历史数据清理失败：{error}"))?;
+    Ok(())
 }
 
 fn migrate_dynamic_categories(connection: &mut Connection) -> Result<(), String> {
@@ -528,6 +571,61 @@ fn save_feed_rows(
     Ok(saved)
 }
 
+fn reconcile_history_dynamics(
+    transaction: &rusqlite::Transaction<'_>,
+    owner_uin: &str,
+) -> Result<(), String> {
+    let history_rows = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT cell_id,content FROM archive_dynamics
+                 WHERE owner_uin=?1 AND category='self' AND cell_id LIKE 'history-v2:%'
+                   AND TRIM(COALESCE(content,''))<>''",
+            )
+            .map_err(|error| format!("读取待合并历史动态失败：{error}"))?;
+        let rows = statement
+            .query_map(params![owner_uin], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| format!("查询待合并历史动态失败：{error}"))?;
+        rows.filter_map(Result::ok).collect::<Vec<_>>()
+    };
+    for (history_cell_id, content) in history_rows {
+        let candidates = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT cell_id FROM archive_dynamics
+                     WHERE owner_uin=?1 AND category='self'
+                       AND cell_id NOT LIKE 'history-v2:%'
+                       AND TRIM(COALESCE(content,''))=TRIM(?2)
+                     LIMIT 2",
+                )
+                .map_err(|error| format!("查找可见说说匹配项失败：{error}"))?;
+            let rows = statement
+                .query_map(params![owner_uin, content], |row| row.get::<_, String>(0))
+                .map_err(|error| format!("查询可见说说匹配项失败：{error}"))?;
+            rows.filter_map(Result::ok).collect::<Vec<_>>()
+        };
+        if candidates.len() != 1 {
+            continue;
+        }
+        transaction
+            .execute(
+                "UPDATE archive_feeds SET cell_id=?1
+                 WHERE owner_uin=?2 AND cell_id=?3",
+                params![candidates[0], owner_uin, history_cell_id],
+            )
+            .map_err(|error| format!("合并历史互动失败：{error}"))?;
+        transaction
+            .execute(
+                "DELETE FROM archive_dynamics WHERE owner_uin=?1 AND cell_id=?2",
+                params![owner_uin, history_cell_id],
+            )
+            .map_err(|error| format!("清理重复历史动态失败：{error}"))?;
+    }
+    Ok(())
+}
+
 fn save_page(
     app: &tauri::AppHandle,
     owner_uin: &str,
@@ -581,6 +679,7 @@ fn save_retried_page(
         .transaction()
         .map_err(|error| format!("无法开始重试事务：{error}"))?;
     let saved = save_feed_rows(&transaction, owner_uin, feeds)?;
+    reconcile_history_dynamics(&transaction, owner_uin)?;
     transaction
         .commit()
         .map_err(|error| format!("提交重试事务失败：{error}"))?;

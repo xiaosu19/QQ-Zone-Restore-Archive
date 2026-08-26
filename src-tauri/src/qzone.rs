@@ -1330,6 +1330,9 @@ fn decode_history_html(response: &str) -> Result<String, String> {
         .replace("\\/", "/")
         .replace("\\'", "'")
         .replace("\\\"", "\"")
+        .replace("\\t", " ")
+        .replace("\\r", " ")
+        .replace("\\n", "\n")
         .replace("\\\\", "\\"))
 }
 
@@ -1357,31 +1360,131 @@ fn history_plain_text(markup: &str) -> String {
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#39;", "'");
-    decoded.split_whitespace().collect::<Vec<_>>().join(" ")
+    decoded
+        .replace("\\t", " ")
+        .replace("\\r", " ")
+        .replace("\\n", "\n")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-fn history_element(markup: &str, tag: &str, class_name: &str) -> Option<(String, String)> {
+fn history_elements(markup: &str, tag: &str, class_name: &str) -> Vec<(String, String)> {
     let pattern = regex::Regex::new(&format!(
         r#"(?is)<{tag}\b(?P<attrs>[^>]*)>(?P<body>.*?)</{tag}>"#
     ))
-    .ok()?;
-    let found = pattern.captures_iter(markup).find_map(|captures| {
-        let attrs = captures.name("attrs")?.as_str();
-        let classes = history_attribute(attrs, "class")?;
-        classes
-            .split_whitespace()
-            .any(|class| class == class_name)
-            .then(|| {
-                (
-                    attrs.to_owned(),
-                    captures
-                        .name("body")
-                        .map(|body| body.as_str().to_owned())
-                        .unwrap_or_default(),
-                )
-            })
-    });
-    found
+    .expect("fixed history element regex");
+    pattern
+        .captures_iter(markup)
+        .filter_map(|captures| {
+            let attrs = captures.name("attrs")?.as_str();
+            let classes = history_attribute(attrs, "class")?;
+            classes
+                .split_whitespace()
+                .any(|class| class == class_name)
+                .then(|| {
+                    (
+                        attrs.to_owned(),
+                        captures
+                            .name("body")
+                            .map(|body| body.as_str().to_owned())
+                            .unwrap_or_default(),
+                    )
+                })
+        })
+        .collect()
+}
+
+fn history_element(markup: &str, tag: &str, class_name: &str) -> Option<(String, String)> {
+    history_elements(markup, tag, class_name).into_iter().next()
+}
+
+fn history_event_key(value: &str) -> Option<(String, i64, i64, i64)> {
+    let captures = regex::Regex::new(r"^fct_(\d+)_(\d+)_(\d+)_(\d+)(?:_|$)")
+        .expect("fixed history event key regex")
+        .captures(value)?;
+    Some((
+        captures.get(1)?.as_str().to_owned(),
+        captures.get(2)?.as_str().parse().ok()?,
+        captures.get(3)?.as_str().parse().ok()?,
+        captures.get(4)?.as_str().parse().ok()?,
+    ))
+}
+
+fn history_content_media(card_body: &str) -> Vec<String> {
+    let image_pattern = regex::Regex::new(r"(?is)<img\b(?P<attrs>[^>]*)>")
+        .expect("fixed history image regex");
+    let mut urls = history_elements(card_body, "a", "img-item")
+        .into_iter()
+        .flat_map(|(_, body)| {
+            image_pattern
+                .captures_iter(&body)
+                .filter_map(|image| image.name("attrs"))
+                .filter_map(|attrs| {
+                    history_attribute(attrs.as_str(), "src")
+                        .or_else(|| history_attribute(attrs.as_str(), "data-src"))
+                })
+                .collect::<Vec<_>>()
+        })
+        .map(|url| {
+            if url.starts_with("//") {
+                format!("https:{url}")
+            } else {
+                url
+            }
+        })
+        .filter(|url| {
+            let lower = url.to_ascii_lowercase();
+            url.starts_with("http")
+                && !lower.contains("qlogo")
+                && !lower.contains("headimg")
+                && !lower.contains("qzonestyle")
+                && !lower.contains("custompraise")
+                && (lower.contains("qpic.cn") || lower.contains("photo.store.qq.com"))
+        })
+        .collect::<Vec<_>>();
+    urls.sort();
+    urls.dedup();
+    urls
+}
+
+fn history_mood_cell_id(card_body: &str, owner_uin: &str) -> Option<String> {
+    let pattern = regex::Regex::new(
+        r#"(?i)(?:https?:)?//user\.qzone\.qq\.com/(\d+)/mood/([^?&"'<>/\s]+)"#,
+    )
+    .expect("fixed Qzone mood URL regex");
+    pattern.captures_iter(card_body).find_map(|captures| {
+        (captures.get(1)?.as_str() == owner_uin)
+            .then(|| captures.get(2).map(|value| value.as_str().to_owned()))
+            .flatten()
+    })
+}
+
+fn history_original_content(content: &str, owner_name: Option<&str>) -> Option<String> {
+    let mut content = content.trim().to_owned();
+    let owner_name = owner_name.map(str::trim).filter(|name| !name.is_empty())?;
+    if !content.starts_with(owner_name) {
+        return None;
+    }
+    content = content[owner_name.len()..]
+        .trim_start_matches(|character: char| {
+            character.is_whitespace()
+                || matches!(character, ':' | '：' | '，' | ',' | '。' | '·' | '-')
+        })
+        .trim()
+        .to_owned();
+    for marker in ["的主页", "的说说"] {
+        if let Some(rest) = content.strip_prefix(marker) {
+            content = rest
+                .trim_start_matches(|character: char| {
+                    character.is_whitespace()
+                        || matches!(character, ':' | '：' | '，' | ',' | '。' | '·' | '-')
+                })
+                .trim()
+                .to_owned();
+        }
+    }
+    (!content.is_empty()).then_some(content)
 }
 
 fn history_html_as_feeds(
@@ -1389,52 +1492,54 @@ fn history_html_as_feeds(
     owner_uin: &str,
     owner_name: Option<&str>,
     _offset: u32,
-) -> Vec<Value> {
+) -> (usize, Vec<Value>) {
     let card_pattern = regex::Regex::new(r"(?is)<li\b(?P<attrs>[^>]*)>(?P<body>.*?)</li>")
         .expect("fixed history card regex");
-    let image_pattern = regex::Regex::new(r"(?is)<img\b(?P<attrs>[^>]*)>")
-        .expect("fixed history image regex");
-    card_pattern
+    let cards = card_pattern
         .captures_iter(html)
+        .filter(|card| {
+            card.name("attrs")
+                .and_then(|attrs| history_attribute(attrs.as_str(), "class"))
+                .is_some_and(|classes| {
+                    ["f-single", "f-s-s"].iter().all(|required| {
+                        classes.split_whitespace().any(|class| class == *required)
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+    let scanned_count = cards.len();
+    let feeds = cards
+        .into_iter()
         .filter_map(|card| {
             let card_attrs = card.name("attrs")?.as_str();
-            let card_classes = history_attribute(card_attrs, "class")?;
-            if !["f-single", "f-s-s"]
-                .iter()
-                .all(|required| card_classes.split_whitespace().any(|class| class == *required))
-            {
-                return None;
-            }
             let card_body = card.name("body")?.as_str();
-            let author = history_element(card_body, "a", "q_namecard");
-            let parsed_author_name = author
-                .as_ref()
-                .map(|(_, body)| history_plain_text(body))
-                .filter(|value| !value.is_empty());
-            let parsed_author_uin = author.as_ref().and_then(|(attrs, _)| {
-                ["link", "data-uin", "href"]
-                    .iter()
-                    .find_map(|name| history_attribute(attrs, name).and_then(|value| trailing_qq_number(&value)))
-            });
+            let stable_id = history_attribute(card_attrs, "data-key")
+                .or_else(|| history_attribute(card_attrs, "id"))?;
+            let (actor_uin, family, subtype, key_time) = history_event_key(&stable_id)?;
+            let event_type = match family {
+                217 => 217,
+                311 => 2,
+                _ => return None,
+            };
+            let people = history_elements(card_body, "a", "q_namecard")
+                .into_iter()
+                .filter_map(|(attrs, body)| {
+                    let uin = ["link", "data-uin", "href"].iter().find_map(|name| {
+                        history_attribute(&attrs, name)
+                            .and_then(|value| trailing_qq_number(&value))
+                    })?;
+                    let name = history_plain_text(&body);
+                    Some((uin, name))
+                })
+                .collect::<Vec<_>>();
+            let actor_name = people
+                .iter()
+                .find(|(uin, _)| uin == &actor_uin)
+                .map(|(_, name)| name.clone())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| actor_uin.clone());
             let (_, content_markup) = history_element(card_body, "p", "txt-box-title")?;
-            let content = history_plain_text(&content_markup);
-            if content.is_empty() {
-                return None;
-            }
-            let owner_name_matches = owner_name
-                .filter(|name| !name.trim().is_empty())
-                .is_some_and(|name| content.contains(name));
-            let is_owner = parsed_author_uin.as_deref() == Some(owner_uin) || owner_name_matches;
-            let author_uin = if is_owner {
-                Some(owner_uin.to_owned())
-            } else {
-                parsed_author_uin
-            };
-            let author_name = if is_owner {
-                owner_name.map(str::to_owned).or(parsed_author_name)
-            } else {
-                parsed_author_name
-            };
+            let content = history_original_content(&history_plain_text(&content_markup), owner_name)?;
             let time_node = history_element(card_body, "div", "info-detail");
             let time_text = time_node
                 .as_ref()
@@ -1444,59 +1549,66 @@ fn history_html_as_feeds(
                 .as_ref()
                 .map(|(attrs, _)| attrs.as_str())
                 .unwrap_or_default();
-            let published_at = parse_history_timestamp(&format!("{time_markup} {time_text}"));
-            let pictures = image_pattern
-                .captures_iter(card_body)
-                .filter_map(|image| image.name("attrs"))
-                .filter_map(|attrs| {
-                    history_attribute(attrs.as_str(), "src")
-                        .or_else(|| history_attribute(attrs.as_str(), "data-src"))
-                })
-                .map(|url| {
-                    if url.starts_with("//") {
-                        format!("https:{url}")
-                    } else {
-                        url
-                    }
-                })
-                .filter(|url| url.starts_with("http"))
+            let parsed_time = parse_history_timestamp(&format!("{time_markup} {time_text}"));
+            let event_time = if key_time > 0 { key_time } else { parsed_time };
+            let media_urls = history_content_media(card_body);
+            let pictures = media_urls
+                .iter()
                 .map(|url| json!({ "photourl": [{ "url": url }] }))
                 .collect::<Vec<_>>();
-            let stable_id = history_attribute(card_attrs, "data-key")
-                .or_else(|| history_attribute(card_attrs, "id"))
-                .unwrap_or_else(|| {
-                    format!(
-                        "{:016x}",
-                        history_record_hash(&[
-                            &content,
-                            &time_text,
-                            author_uin.as_deref().unwrap_or_default(),
-                        ])
-                    )
-                });
-            let cell_id = format!("history-html:{stable_id}");
+            let joined_media = media_urls.join("\n");
+            let cell_id = history_mood_cell_id(card_body, owner_uin).unwrap_or_else(|| {
+                format!(
+                    "history-v2:{:016x}",
+                    history_record_hash(&[owner_uin, &content, &joined_media])
+                )
+            });
+            let target_name = people
+                .iter()
+                .find(|(uin, _)| uin != &actor_uin && uin != owner_uin)
+                .map(|(_, name)| name.as_str());
+            let event_summary = match event_type {
+                217 => "点赞了这条说说".to_owned(),
+                _ if subtype == 14 || subtype == 35 => target_name
+                    .map(|name| format!("回复了 {name}（旧历史接口未保留回复正文）"))
+                    .unwrap_or_else(|| "历史回复（旧历史接口未保留回复正文）".to_owned()),
+                _ => "历史评论（旧历史接口未保留评论正文）".to_owned(),
+            };
+            let comments = (event_type == 2).then(|| {
+                json!({
+                    "main_comment": {
+                        "commentid": stable_id,
+                        "content": event_summary,
+                        "date": event_time,
+                        "user": { "uin": actor_uin, "nickname": actor_name },
+                        "replys": [],
+                    }
+                })
+            });
             Some(json!({
                 "comm": {
-                    "subid": 0,
-                    "time": published_at,
-                    "feedskey": format!("history-html:{stable_id}"),
+                    "subid": event_type,
+                    "time": event_time,
+                    "feedskey": format!("history-v2-event:{stable_id}"),
                 },
-                "userinfo": { "user": { "uin": author_uin.clone(), "nickname": author_name.clone() } },
-                "summary": { "summary": content.clone() },
+                "userinfo": { "user": { "uin": actor_uin, "nickname": actor_name } },
+                "summary": { "summary": event_summary },
                 "original": {
                     "cell_id": { "cellid": cell_id },
                     "cell_comm": {
                         "appid": 311,
-                        "time": published_at,
-                        "feedskey": format!("history-html:{stable_id}"),
+                        "time": 0,
+                        "feedskey": format!("history-v2-original:{:016x}", history_record_hash(&[owner_uin, &content, &joined_media])),
                     },
-                    "cell_userinfo": { "user": { "uin": author_uin, "nickname": author_name } },
+                    "cell_userinfo": { "user": { "uin": owner_uin, "nickname": owner_name } },
                     "cell_summary": { "summary": content },
                     "cell_pic": { "picdata": { "pic": pictures } },
+                    "cell_comment": comments,
                 },
             }))
         })
-        .collect()
+        .collect();
+    (scanned_count, feeds)
 }
 
 pub(crate) async fn fetch_history_messages(
@@ -1567,9 +1679,10 @@ pub(crate) async fn fetch_history_messages(
                     ));
                 } else {
                     let html = decode_history_html(&body)?;
-                    let feeds = history_html_as_feeds(&html, &auth.uin, owner_name, offset);
+                    let (record_count, feeds) =
+                        history_html_as_feeds(&html, &auth.uin, owner_name, offset);
                     return Ok(HistoryMessagePage {
-                        record_count: feeds.len(),
+                        record_count,
                         feeds,
                     });
                 }
@@ -2028,24 +2141,43 @@ mod tests {
     }
 
     #[test]
-    fn parses_getqzonehistory_html_records_as_owner_dynamics() {
-        let response = r#"_Callback({html:'\x3Cli class="f-single f-s-s" data-key="old-1"\x3E\x3Ca class="f-name q_namecard" link="nameCard_10001"\x3E本人\x3C/a\x3E\x3Cdiv class="info-detail" data-time="1627745220"\x3E2021年7月31日 23:27\x3C/div\x3E\x3Cp class="txt-box-title ellipsis-one"\x3E本人：一条历史说说\x3C/p\x3E\x3Ca class="img-item"\x3E\x3Cimg src="//example.com/old.jpg"\x3E\x3C/a\x3E\x3C/li\x3E',opuin:'10001'});"#;
+    fn classifies_history_notifications_and_filters_decorative_media() {
+        let response = r#"_Callback({html:'\x3Cli class="f-single f-s-s" data-key="fct_20001_217_3_1627745220_1_1"\x3E\x3Ca class="f-name q_namecard" link="nameCard_20001"\x3E好友甲\x3C/a\x3E\x3Ca href="//user.qzone.qq.com/10001/mood/moment-1"\x3E查看说说\x3C/a\x3E\x3Cdiv class="info-detail" data-time="1627745220"\x3E2021年7月31日 23:27\x3C/div\x3E\x3Cp class="txt-box-title ellipsis-one"\x3E本人：\t\t一条历史说说\x3C/p\x3E\x3Cimg src="//qlogo2.store.qq.com/qzone/20001/20001/50"\x3E\x3Ca class="img-item"\x3E\x3Cimg src="//a1.qpic.cn/old.jpg"\x3E\x3C/a\x3E\x3C/li\x3E\x3Cli class="f-single f-s-s" data-key="fct_30001_311_14_1627745320_1_1"\x3E\x3Ca class="f-name q_namecard" link="nameCard_30001"\x3E好友乙\x3C/a\x3E\x3Ca href="//user.qzone.qq.com/10001/mood/moment-1"\x3E查看说说\x3C/a\x3E\x3Cdiv class="info-detail" data-time="1627745320"\x3E2021年7月31日 23:28\x3C/div\x3E\x3Cp class="txt-box-title ellipsis-one"\x3E本人：一条历史说说\x3C/p\x3E\x3C/li\x3E\x3Cli class="f-single f-s-s" data-key="fct_40001_333_15_1627745420_1_1"\x3E\x3Cp class="txt-box-title ellipsis-one"\x3E本人：系统通知\x3C/p\x3E\x3C/li\x3E',opuin:'10001'});"#;
         let html = decode_history_html(response).expect("应解码旧历史消息 HTML");
-        let feeds = history_html_as_feeds(&html, "10001", Some("本人"), 0);
-        assert_eq!(feeds.len(), 1);
+        let (scanned, feeds) = history_html_as_feeds(&html, "10001", Some("本人"), 0);
+        assert_eq!(scanned, 3);
+        assert_eq!(feeds.len(), 2);
+        assert_eq!(feeds[0]["comm"]["subid"], 217);
+        assert_eq!(feeds[1]["comm"]["subid"], 2);
+        assert_eq!(feeds[0]["userinfo"]["user"]["uin"], "20001");
+        assert_eq!(feeds[1]["userinfo"]["user"]["uin"], "30001");
+        assert_eq!(feeds[0]["original"]["cell_id"]["cellid"], "moment-1");
+        assert_eq!(feeds[1]["original"]["cell_id"]["cellid"], "moment-1");
         assert_eq!(
             feeds[0]["original"]["cell_userinfo"]["user"]["uin"],
             "10001"
         );
         assert_eq!(
             feeds[0]["original"]["cell_summary"]["summary"],
-            "本人：一条历史说说"
+            "一条历史说说"
         );
         assert_eq!(
             feeds[0]["original"]["cell_pic"]["picdata"]["pic"][0]["photourl"][0]["url"],
-            "https://example.com/old.jpg"
+            "https://a1.qpic.cn/old.jpg"
         );
-        assert_eq!(feeds[0]["original"]["cell_comm"]["time"], 1_627_745_220);
+        assert_eq!(
+            feeds[0]["original"]["cell_pic"]["picdata"]["pic"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(feeds[0]["comm"]["time"], 1_627_745_220);
+        assert_eq!(feeds[0]["original"]["cell_comm"]["time"], 0);
+        assert!(!feeds[0]["original"]["cell_summary"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("\\t"));
     }
 
     #[test]

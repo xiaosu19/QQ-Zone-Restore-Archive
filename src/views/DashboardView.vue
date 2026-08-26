@@ -20,6 +20,7 @@ const recent = ref<ArchiveItem[]>([]);
 const ranking = ref<InteractionRank[]>([]);
 const loading = ref(false);
 const avatarSources = reactive<Record<string, string>>({});
+let refreshTimer: number | undefined;
 const storageText = computed(() => overview.value.databaseBytes < 1024 * 1024 ? `${(overview.value.databaseBytes / 1024).toFixed(1)} KB` : `${(overview.value.databaseBytes / 1024 / 1024).toFixed(1)} MB`);
 const taskSeverity = computed(() => ({ completed: "success", running: "info", error: "danger", cancelled: "warn", limited: "warn", idle: "secondary" }[progress.value.status]));
 const taskText = computed(() => ({ completed: "已完成", running: "归档中", error: "异常", cancelled: "已取消", limited: "频率保护", idle: "未开始" }[progress.value.status]));
@@ -46,8 +47,8 @@ async function loadAvatar(uin: string) {
 }
 
 async function loadDashboard() {
-  releaseAvatars();
   if (!loggedIn.value) { overview.value = { dynamics: 0, pictures: 0, comments: 0, likes: 0, databaseBytes: 0 }; recent.value = []; ranking.value = []; return; }
+  if (loading.value) return;
   loading.value = true;
   try {
     const [stats, items, task, ranks] = await Promise.all([getArchiveOverview(), listArchivedFeeds(3, 0), getArchiveProgress(), getInteractionRanking(8)]);
@@ -56,16 +57,41 @@ async function loadDashboard() {
     await Promise.all([...new Set(avatarUins)].map(loadAvatar));
   } finally { loading.value = false; }
 }
+async function pollDashboard() {
+  if (!loggedIn.value || loading.value) return;
+  try {
+    const task = await getArchiveProgress();
+    const wasRunning = progress.value.status === "running";
+    progress.value = task;
+    if (task.status === "running" || wasRunning) await loadDashboard();
+  } catch (reason) {
+    console.warn("概览自动刷新失败", reason);
+  }
+}
+function handleVisibilityChange() {
+  if (document.visibilityState === "visible") void loadDashboard();
+}
 function primaryAction() { loggedIn.value ? router.push("/tasks") : authStore.openLogin(); }
 watch(loggedIn, loadDashboard);
-onMounted(loadDashboard);
-onBeforeUnmount(releaseAvatars);
+onMounted(() => {
+  void loadDashboard();
+  refreshTimer = window.setInterval(pollDashboard, 2_000);
+  document.addEventListener("visibilitychange", handleVisibilityChange);
+});
+onBeforeUnmount(() => {
+  if (refreshTimer !== undefined) window.clearInterval(refreshTimer);
+  document.removeEventListener("visibilitychange", handleVisibilityChange);
+  releaseAvatars();
+});
 </script>
 
 <template>
   <section class="hero-panel">
     <div><span class="section-kicker">{{ loggedIn ? `QQ ${user?.uin}` : "开始使用" }}</span><h2>{{ loggedIn ? `${user?.nickname}，欢迎回来` : "把珍贵的空间记忆，安全保存在本地" }}</h2><p>{{ loggedIn ? `本地已保存 ${overview.dynamics} 条动态和 ${overview.pictures} 张图片。` : "登录 QQ 空间后，可以归档动态、图片、视频和互动记录。" }}</p></div>
-    <Button :label="loggedIn ? '开始归档' : '登录 QQ 空间'" :icon="loggedIn ? 'pi pi-download' : 'pi pi-link'" :loading="loading" @click="primaryAction" />
+    <div class="hero-actions">
+      <Button v-if="loggedIn" label="刷新数据" icon="pi pi-refresh" severity="secondary" outlined :loading="loading" @click="loadDashboard" />
+      <Button :label="loggedIn ? '开始归档' : '登录 QQ 空间'" :icon="loggedIn ? 'pi pi-download' : 'pi pi-link'" :loading="loading" @click="primaryAction" />
+    </div>
   </section>
   <section class="stats-grid" aria-label="归档统计">
     <StatCard label="动态" :value="String(overview.dynamics)" :hint="overview.dynamics ? '当前账号本地归档' : '等待首次归档'" icon="pi pi-comment" tone="blue" />
