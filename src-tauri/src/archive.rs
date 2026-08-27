@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::PathBuf,
     sync::{
@@ -354,7 +354,143 @@ fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
     migrate_legacy_dynamics(&mut connection)?;
     migrate_dynamic_categories(&mut connection)?;
     migrate_history_v1_records(&mut connection)?;
+    migrate_qzone_mood_aliases(&mut connection)?;
     Ok(connection)
+}
+
+fn canonical_qzone_cell_id(cell_id: &str) -> Option<String> {
+    let (base, suffix) = cell_id.rsplit_once('.')?;
+    (!base.is_empty()
+        && (suffix.is_empty() || suffix.chars().all(|character| character.is_ascii_digit())))
+    .then(|| base.to_owned())
+}
+
+fn migrate_qzone_mood_aliases(connection: &mut Connection) -> Result<(), String> {
+    let applied = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM archive_migrations WHERE name='canonical-qzone-mood-aliases-v1')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查说说别名合并状态失败：{error}"))?;
+    if applied {
+        return Ok(());
+    }
+    let aliases = {
+        let mut statement = connection
+            .prepare(
+                "SELECT owner_uin,cell_id,published_at,content,author_uin,author_name,category,
+                        pictures_json,video_json,raw_original_json,archived_at
+                 FROM archive_dynamics",
+            )
+            .map_err(|error| format!("读取待合并说说别名失败：{error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                let cell_id = row.get::<_, String>(1)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    cell_id.clone(),
+                    canonical_qzone_cell_id(&cell_id),
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, i64>(10)?,
+                ))
+            })
+            .map_err(|error| format!("查询待合并说说别名失败：{error}"))?;
+        rows.filter_map(Result::ok)
+            .filter(|row| row.2.is_some())
+            .collect::<Vec<_>>()
+    };
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("开始说说别名合并失败：{error}"))?;
+    for (
+        owner_uin,
+        alias,
+        canonical,
+        published_at,
+        content,
+        author_uin,
+        author_name,
+        category,
+        pictures_json,
+        video_json,
+        raw_original_json,
+        archived_at,
+    ) in aliases
+    {
+        let canonical = canonical.expect("filtered canonical id");
+        let target_exists = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM archive_dynamics WHERE owner_uin=?1 AND cell_id=?2)",
+                params![owner_uin, canonical],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| format!("检查说说别名目标失败：{error}"))?;
+        if target_exists {
+            transaction
+                .execute(
+                    "UPDATE archive_dynamics SET
+                       published_at=CASE WHEN published_at<=0 AND ?3>0 THEN ?3 ELSE published_at END,
+                       content=CASE WHEN TRIM(COALESCE(content,''))='' THEN ?4 ELSE content END,
+                       author_uin=COALESCE(author_uin,?5),author_name=COALESCE(author_name,?6),
+                       category=CASE WHEN category='' THEN ?7 ELSE category END,
+                       pictures_json=CASE WHEN LENGTH(COALESCE(?8,''))>LENGTH(COALESCE(pictures_json,'')) THEN ?8 ELSE pictures_json END,
+                       video_json=CASE WHEN LENGTH(COALESCE(?9,''))>LENGTH(COALESCE(video_json,'')) THEN ?9 ELSE video_json END,
+                       raw_original_json=CASE WHEN LENGTH(?10)>LENGTH(raw_original_json) THEN ?10 ELSE raw_original_json END,
+                       archived_at=MAX(archived_at,?11)
+                     WHERE owner_uin=?1 AND cell_id=?2",
+                    params![
+                        owner_uin,
+                        canonical,
+                        published_at,
+                        content,
+                        author_uin,
+                        author_name,
+                        category,
+                        pictures_json,
+                        video_json,
+                        raw_original_json,
+                        archived_at
+                    ],
+                )
+                .map_err(|error| format!("合并说说别名内容失败：{error}"))?;
+            transaction
+                .execute(
+                    "DELETE FROM archive_dynamics WHERE owner_uin=?1 AND cell_id=?2",
+                    params![owner_uin, alias],
+                )
+                .map_err(|error| format!("删除重复说说别名失败：{error}"))?;
+        } else {
+            transaction
+                .execute(
+                    "UPDATE archive_dynamics SET cell_id=?1 WHERE owner_uin=?2 AND cell_id=?3",
+                    params![canonical, owner_uin, alias],
+                )
+                .map_err(|error| format!("规范说说编号失败：{error}"))?;
+        }
+        transaction
+            .execute(
+                "UPDATE archive_feeds SET cell_id=?1 WHERE owner_uin=?2 AND cell_id=?3",
+                params![canonical, owner_uin, alias],
+            )
+            .map_err(|error| format!("合并说说互动失败：{error}"))?;
+    }
+    transaction
+        .execute(
+            "INSERT INTO archive_migrations(name,applied_at) VALUES ('canonical-qzone-mood-aliases-v1',?1)",
+            params![now()],
+        )
+        .map_err(|error| format!("记录说说别名合并状态失败：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交说说别名合并失败：{error}"))
 }
 
 fn migrate_history_v1_records(connection: &mut Connection) -> Result<(), String> {
@@ -686,6 +822,103 @@ fn save_retried_page(
     Ok(saved)
 }
 
+fn unresolved_actor_uins(app: &tauri::AppHandle, owner_uin: &str) -> Result<Vec<String>, String> {
+    let connection = open_database(app)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT actor_uin FROM archive_feeds
+             WHERE owner_uin=?1 AND actor_uin IS NOT NULL AND actor_uin<>''
+               AND (actor_name IS NULL OR TRIM(actor_name)='' OR actor_name=actor_uin)
+             ORDER BY actor_uin",
+        )
+        .map_err(|error| format!("读取待补全昵称失败：{error}"))?;
+    let rows = statement
+        .query_map(params![owner_uin], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("查询待补全昵称失败：{error}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("读取待补全昵称失败：{error}"))
+}
+
+fn known_actor_names(
+    app: &tauri::AppHandle,
+    owner_uin: &str,
+) -> Result<HashMap<String, String>, String> {
+    let connection = open_database(app)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT actor_uin,MAX(actor_name) FROM archive_feeds
+             WHERE owner_uin=?1 AND actor_uin IS NOT NULL AND actor_uin<>''
+               AND actor_name IS NOT NULL AND TRIM(actor_name)<>'' AND actor_name<>actor_uin
+             GROUP BY actor_uin",
+        )
+        .map_err(|error| format!("读取已有互动昵称失败：{error}"))?;
+    let rows = statement
+        .query_map(params![owner_uin], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("查询已有互动昵称失败：{error}"))?;
+    rows.collect::<Result<HashMap<_, _>, _>>()
+        .map_err(|error| format!("读取已有互动昵称失败：{error}"))
+}
+
+fn apply_actor_names(
+    app: &tauri::AppHandle,
+    owner_uin: &str,
+    names: &HashMap<String, String>,
+) -> Result<u64, String> {
+    if names.is_empty() {
+        return Ok(0);
+    }
+    let mut connection = open_database(app)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("无法开始昵称补全事务：{error}"))?;
+    let mut updated = 0_u64;
+    for (uin, nickname) in names {
+        if nickname.trim().is_empty() || nickname == uin {
+            continue;
+        }
+        updated = updated.saturating_add(
+            transaction
+                .execute(
+                    "UPDATE archive_feeds SET actor_name=?1
+                     WHERE owner_uin=?2 AND actor_uin=?3
+                       AND (actor_name IS NULL OR TRIM(actor_name)='' OR actor_name=actor_uin)",
+                    params![nickname, owner_uin, uin],
+                )
+                .map_err(|error| format!("写入互动昵称失败：{error}"))? as u64,
+        );
+        transaction
+            .execute(
+                "UPDATE archive_dynamics SET author_name=?1
+                 WHERE owner_uin=?2 AND author_uin=?3
+                   AND (author_name IS NULL OR TRIM(author_name)='' OR author_name=author_uin)",
+                params![nickname, owner_uin, uin],
+            )
+            .map_err(|error| format!("写入动态作者昵称失败：{error}"))?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("提交昵称补全事务失败：{error}"))?;
+    Ok(updated)
+}
+
+async fn enrich_archive_actor_names(
+    app: &tauri::AppHandle,
+    login: &QLoginState,
+    owner_uin: &str,
+) -> Result<u64, String> {
+    let known = known_actor_names(app, owner_uin)?;
+    let mut updated = apply_actor_names(app, owner_uin, &known)?;
+    let unresolved = unresolved_actor_uins(app, owner_uin)?;
+    if unresolved.is_empty() {
+        return Ok(updated);
+    }
+    let names = qzone::fetch_portrait_names(login, unresolved).await?;
+    updated = updated.saturating_add(apply_actor_names(app, owner_uin, &names)?);
+    Ok(updated)
+}
+
 struct ArchiveCheckpoint {
     cursor: String,
     pages: u32,
@@ -1007,7 +1240,12 @@ fn save_original_dynamic(
          (owner_uin,cell_id,published_at,content,author_uin,author_name,category,pictures_json,video_json,raw_original_json,archived_at)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
          ON CONFLICT(owner_uin,cell_id) DO UPDATE SET
-          published_at=excluded.published_at,content=excluded.content,author_uin=excluded.author_uin,
+          published_at=CASE
+            WHEN archive_dynamics.published_at<=0 THEN excluded.published_at
+            WHEN excluded.published_at<=0 THEN archive_dynamics.published_at
+            ELSE MIN(archive_dynamics.published_at,excluded.published_at)
+          END,
+          content=excluded.content,author_uin=excluded.author_uin,
           author_name=excluded.author_name,category=excluded.category,pictures_json=COALESCE(excluded.pictures_json,archive_dynamics.pictures_json),
           video_json=COALESCE(excluded.video_json,archive_dynamics.video_json),
           raw_original_json=excluded.raw_original_json,archived_at=excluded.archived_at",
@@ -1193,7 +1431,10 @@ pub async fn load_archived_image(
                     reqwest::header::ACCEPT,
                     "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8",
                 )
-                .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5");
+                .header(
+                    reqwest::header::ACCEPT_LANGUAGE,
+                    "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5",
+                );
             if with_cookie {
                 request = request.header(reqwest::header::COOKIE, &auth.cookie_header);
             }
@@ -1339,7 +1580,10 @@ pub async fn load_archived_video(
                     reqwest::header::ACCEPT,
                     "video/mp4,video/*;q=0.9,application/octet-stream;q=0.8,*/*;q=0.5",
                 )
-                .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5");
+                .header(
+                    reqwest::header::ACCEPT_LANGUAGE,
+                    "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5",
+                );
             if with_cookie {
                 request = request.header(reqwest::header::COOKIE, &auth.cookie_header);
             }
@@ -1563,7 +1807,10 @@ async fn sync_visible_moments(
         if summary.owner_name.is_none() {
             summary.owner_name = page.feeds.iter().find_map(|feed| {
                 let uin = feed.pointer("/original/cell_userinfo/user/uin")?;
-                let uin = uin.as_str().map(str::to_owned).or_else(|| uin.as_i64().map(|v| v.to_string()))?;
+                let uin = uin
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| uin.as_i64().map(|v| v.to_string()))?;
                 (uin == owner_uin)
                     .then(|| text_at(feed, "/original/cell_userinfo/user/nickname"))
                     .flatten()
@@ -1572,9 +1819,7 @@ async fn sync_visible_moments(
         let feed_count = page.feeds.len() as u64;
         let saved = save_retried_page(app, owner_uin, &page.feeds)?;
         summary.pages = summary.pages.saturating_add(1);
-        summary.moments = summary
-            .moments
-            .saturating_add(page.moment_count as u64);
+        summary.moments = summary.moments.saturating_add(page.moment_count as u64);
         summary.saved = summary.saved.saturating_add(saved);
         set_progress(archive, |progress| {
             progress.pages = progress.pages.saturating_add(1);
@@ -1604,6 +1849,50 @@ struct HistorySyncSummary {
     pages: u32,
     records: u64,
     saved: u64,
+    estimated_end_offset: u32,
+    deepest_probe_offset: u32,
+}
+
+#[derive(Default)]
+struct ArchiveQualitySummary {
+    historical_interactions: u64,
+    real_comment_bodies: u64,
+    placeholder_comments: u64,
+    unresolved_names: u64,
+}
+
+fn archive_quality_summary(
+    app: &tauri::AppHandle,
+    owner_uin: &str,
+) -> Result<ArchiveQualitySummary, String> {
+    let connection = open_database(app)?;
+    connection
+        .query_row(
+            "SELECT
+               SUM(CASE WHEN feed_key LIKE 'history-v2-event:%' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN feed_key LIKE 'history-v2-event:%'
+                         AND event_type IN (2,311)
+                         AND event_summary NOT LIKE '%旧历史接口未保留%'
+                         AND TRIM(COALESCE(event_summary,''))<>'' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN feed_key LIKE 'history-v2-event:%'
+                         AND event_type IN (2,311)
+                         AND event_summary LIKE '%旧历史接口未保留%' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN actor_uin IS NOT NULL AND actor_uin<>''
+                         AND (actor_name IS NULL OR TRIM(actor_name)='' OR actor_name=actor_uin)
+                        THEN 1 ELSE 0 END)
+             FROM archive_feeds WHERE owner_uin=?1",
+            params![owner_uin],
+            |row| {
+                Ok(ArchiveQualitySummary {
+                    historical_interactions: row.get::<_, Option<i64>>(0)?.unwrap_or(0).max(0)
+                        as u64,
+                    real_comment_bodies: row.get::<_, Option<i64>>(1)?.unwrap_or(0).max(0) as u64,
+                    placeholder_comments: row.get::<_, Option<i64>>(2)?.unwrap_or(0).max(0) as u64,
+                    unresolved_names: row.get::<_, Option<i64>>(3)?.unwrap_or(0).max(0) as u64,
+                })
+            },
+        )
+        .map_err(|error| format!("统计归档完整度失败：{error}"))
 }
 
 async fn sync_history_messages(
@@ -1614,47 +1903,104 @@ async fn sync_history_messages(
     owner_name: Option<&str>,
     interval_ms: u64,
 ) -> Result<HistorySyncSummary, String> {
+    // GetQzonehistory first locates the historical-list boundary. Do the same
+    // with 30-item windows (the largest size verified against the live API),
+    // then read every window up to that boundary. Binary discovery reaches far
+    // deeper than a fixed empty-tail scan while spending far fewer requests.
     const PAGE_SIZE: u32 = 30;
+    const MAX_HISTORY_OFFSET: u32 = 10_000_000;
     let mut summary = HistorySyncSummary::default();
-    let mut offset = 0_u32;
     set_progress(archive, |progress| {
-        progress.message = "正在按 GetQzonehistory 的方式读取历史消息残留…".into();
+        progress.message = "正在按 GetQzonehistory 的方式定位历史数据边界…".into();
     });
-    loop {
+
+    let mut lower_page = 0_u32;
+    let mut upper_page = MAX_HISTORY_OFFSET / PAGE_SIZE;
+    let mut last_nonempty_page: Option<u32> = None;
+    while lower_page <= upper_page {
         if archive.cancel.load(Ordering::Relaxed) {
             return Ok(summary);
         }
         if let Some(retry_at) = reserve_archive_page(app, owner_uin)? {
             return Err(format!("ARCHIVE_RATE_LIMIT:{retry_at}"));
         }
+        let page_index = lower_page + (upper_page - lower_page) / 2;
+        let offset = page_index.saturating_mul(PAGE_SIZE);
         let page = qzone::fetch_history_messages(login, offset, PAGE_SIZE, owner_name).await?;
-        if page.record_count == 0 {
-            return Ok(summary);
-        }
-        let saved = save_retried_page(app, owner_uin, &page.feeds)?;
         summary.pages = summary.pages.saturating_add(1);
-        summary.records = summary.records.saturating_add(page.record_count as u64);
-        summary.saved = summary.saved.saturating_add(saved);
+        summary.deepest_probe_offset = summary.deepest_probe_offset.max(offset);
         set_progress(archive, |progress| {
             progress.pages = progress.pages.saturating_add(1);
-            progress.fetched = progress
-                .fetched
-                .saturating_add(page.record_count as u64);
-            progress.saved = progress.saved.saturating_add(saved);
-            progress.message = format!(
-                "已读取 {} 条历史消息残留，正在继续向更早记录翻页…",
-                summary.records
-            );
+            progress.message =
+                format!("正在定位历史边界：已探测 offset {offset}（上限 {MAX_HISTORY_OFFSET}）…");
         });
-        let advance = u32::try_from(page.record_count).unwrap_or(PAGE_SIZE).max(1);
-        offset = offset
-            .checked_add(advance)
-            .ok_or("历史消息分页偏移量溢出")?;
+        if page.record_count > 0 {
+            last_nonempty_page = Some(page_index);
+            lower_page = page_index.saturating_add(1);
+        } else if page_index == 0 {
+            break;
+        } else {
+            upper_page = page_index - 1;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(
             interval_ms,
         )))
         .await;
     }
+
+    let last_page = last_nonempty_page.unwrap_or(0);
+    summary.estimated_end_offset = last_page.saturating_mul(PAGE_SIZE);
+    set_progress(archive, |progress| {
+        progress.message = format!(
+            "历史边界定位完成（约 offset {}），正在逐页回收全部记录…",
+            summary.estimated_end_offset
+        );
+    });
+
+    for page_index in 0..=last_page {
+        if archive.cancel.load(Ordering::Relaxed) {
+            return Ok(summary);
+        }
+        if let Some(retry_at) = reserve_archive_page(app, owner_uin)? {
+            return Err(format!("ARCHIVE_RATE_LIMIT:{retry_at}"));
+        }
+        let offset = page_index.saturating_mul(PAGE_SIZE);
+        let page = qzone::fetch_history_messages(login, offset, PAGE_SIZE, owner_name).await?;
+        summary.pages = summary.pages.saturating_add(1);
+        summary.deepest_probe_offset = summary.deepest_probe_offset.max(offset);
+        set_progress(archive, |progress| {
+            progress.pages = progress.pages.saturating_add(1)
+        });
+        if page.record_count == 0 {
+            set_progress(archive, |progress| {
+                progress.message =
+                    format!("历史 offset {offset} 暂无内容，继续读取已定位范围内的后续窗口…");
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(
+                interval_ms,
+            )))
+            .await;
+            continue;
+        }
+        let saved = save_retried_page(app, owner_uin, &page.feeds)?;
+        summary.records = summary.records.saturating_add(page.record_count as u64);
+        summary.saved = summary.saved.saturating_add(saved);
+        set_progress(archive, |progress| {
+            progress.fetched = progress.fetched.saturating_add(page.record_count as u64);
+            progress.saved = progress.saved.saturating_add(saved);
+            progress.message = format!(
+                "已读取 {} 条历史消息残留，当前 offset {offset} / {}…",
+                summary.records, summary.estimated_end_offset
+            );
+        });
+        if page_index < last_page {
+            tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(
+                interval_ms,
+            )))
+            .await;
+        }
+    }
+    Ok(summary)
 }
 
 fn interaction_error_can_be_partial(error: &str) -> bool {
@@ -1934,6 +2280,19 @@ pub async fn start_feed_archive(
         }
     }
     .await;
+    let nickname_repair_error = match enrich_archive_actor_names(&app, &login, &owner_uin).await {
+        Ok(updated) => {
+            if updated > 0 {
+                set_progress(&archive, |progress| {
+                    progress.message =
+                        format!("已补全 {updated} 条互动记录的 QQ 昵称，正在整理结果…");
+                });
+            }
+            None
+        }
+        Err(error) => Some(concise_archive_error(&error)),
+    };
+    let quality_summary = archive_quality_summary(&app, &owner_uin).unwrap_or_default();
     let result = match interaction_result {
         Err(error)
             if (visible_summary.moments > 0 || history_summary.records > 0)
@@ -1951,17 +2310,18 @@ pub async fn start_feed_archive(
         }),
         Ok(()) => set_progress(&archive, |p| {
             p.status = "completed";
-            p.message = if let (Some(visible_error), Some(history_error)) = (
-                visible_sync_error.as_deref(),
-                history_sync_error.as_deref(),
-            ) {
+            p.message = if let (Some(visible_error), Some(history_error)) =
+                (visible_sync_error.as_deref(), history_sync_error.as_deref())
+            {
                 format!(
                     "互动通知归档已完成；但可见说说接口（{visible_error}）和历史消息接口（{history_error}）暂时不可用，请稍后重试"
                 )
             } else if let Some(error) = visible_sync_error.as_deref() {
                 format!(
-                    "已读取 {} 条历史消息残留并完成互动补充；但可见说说接口暂时不可用（{error}），稍后重试可补齐仍存在的正文和评论回复",
-                    history_summary.records
+                    "已读取 {} 条历史消息残留（边界约 offset {}，最深探测 {}）并完成互动补充；但可见说说接口暂时不可用（{error}），稍后重试可补齐仍存在的正文和评论回复",
+                    history_summary.records,
+                    history_summary.estimated_end_offset,
+                    history_summary.deepest_probe_offset
                 )
             } else if let Some(error) = history_sync_error.as_deref() {
                 format!(
@@ -1970,19 +2330,23 @@ pub async fn start_feed_archive(
                 )
             } else if p.skipped > 0 {
                 format!(
-                    "归档完成：已同步 {} / {} 条本人可见说说、{} 条历史消息残留，共保存 {} 条接口记录；另有 {} 个异常位置可单独重试",
+                    "归档完成：已同步 {} / {} 条本人可见说说、{} 条历史消息残留（边界约 offset {}，最深探测 {}），共保存 {} 条接口记录；另有 {} 个异常位置可单独重试",
                     visible_summary.moments,
                     visible_summary.total,
                     history_summary.records,
+                    history_summary.estimated_end_offset,
+                    history_summary.deepest_probe_offset,
                     p.saved,
                     p.skipped
                 )
             } else {
                 format!(
-                    "归档完成：已同步 {} / {} 条本人可见说说及评论回复，并合并 {} 条历史消息残留，共保存 {} 条接口记录",
+                    "归档完成：已同步 {} / {} 条本人可见说说及评论回复，并合并 {} 条历史消息残留（边界约 offset {}，最深探测 {}），共保存 {} 条接口记录",
                     visible_summary.moments,
                     visible_summary.total,
                     history_summary.records,
+                    history_summary.estimated_end_offset,
+                    history_summary.deepest_probe_offset,
                     p.saved
                 )
             };
@@ -1995,10 +2359,12 @@ pub async fn start_feed_archive(
                 );
                 p.status = "completed";
                 p.message = format!(
-                    "已保存 {} / {} 条本人可见说说及评论回复，并读取 {} 条历史消息残留；互动通知接口暂时不可用（{}），点赞等互动尚未补齐，请稍后继续归档",
+                    "已保存 {} / {} 条本人可见说说及评论回复，并读取 {} 条历史消息残留（边界约 offset {}，最深探测 {}）；互动通知接口暂时不可用（{}），点赞等互动尚未补齐，请稍后继续归档",
                     visible_summary.moments,
                     visible_summary.total,
                     history_summary.records,
+                    history_summary.estimated_end_offset,
+                    history_summary.deepest_probe_offset,
                     detail
                 );
                 p.retry_at = None;
@@ -2031,6 +2397,26 @@ pub async fn start_feed_archive(
             p.retry_at = None;
         }),
     }
+    if let Some(error) = nickname_repair_error {
+        set_progress(&archive, |progress| {
+            if matches!(progress.status, "completed" | "cancelled") {
+                progress.message.push_str(&format!(
+                    "；部分 QQ 昵称暂未补全（{error}），下次归档会继续重试"
+                ));
+            }
+        });
+    }
+    set_progress(&archive, |progress| {
+        if matches!(progress.status, "completed" | "cancelled") {
+            progress.message.push_str(&format!(
+                "；本地累计历史记录 {} 条，其中已取得 {} 条评论正文、{} 条仅保留互动痕迹，未解析昵称 {} 条",
+                quality_summary.historical_interactions,
+                quality_summary.real_comment_bodies,
+                quality_summary.placeholder_comments,
+                quality_summary.unresolved_names
+            ));
+        }
+    });
     let progress = archive
         .progress
         .lock()
@@ -2039,8 +2425,7 @@ pub async fn start_feed_archive(
     if result.as_ref().is_err_and(|error| {
         error.starts_with("ARCHIVE_RATE_LIMIT:")
             || error.starts_with("ARCHIVE_INTERACTIONS_UNAVAILABLE:")
-    })
-    {
+    }) {
         Ok(progress)
     } else {
         result.map(|_| progress)
@@ -2175,22 +2560,28 @@ pub async fn list_archived_feeds(
     limit: u32,
     offset: u32,
     category: String,
+    year: Option<i32>,
+    descending: Option<bool>,
 ) -> Result<Vec<ArchiveItem>, String> {
     validate_category(&category)?;
     let owner_uin = login.qzone_auth().await?.uin;
     tauri::async_runtime::spawn_blocking(move || {
     let connection = open_database(&app)?;
-    let mut statement = connection
-        .prepare(
+    let order = if descending.unwrap_or(true) { "DESC" } else { "ASC" };
+    let sql = format!(
             "SELECT d.id,d.owner_uin,d.cell_id,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
               (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type=217),
               (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type IN (2,311))
-             FROM archive_dynamics d WHERE d.owner_uin=?1 AND d.category=?2 ORDER BY d.published_at ASC LIMIT ?3 OFFSET ?4",
-        )
+             FROM archive_dynamics d WHERE d.owner_uin=?1 AND d.category=?2
+               AND (?3 IS NULL OR CAST(strftime('%Y',d.published_at,'unixepoch','localtime') AS INTEGER)=?3)
+             ORDER BY d.published_at {order},d.id {order} LIMIT ?4 OFFSET ?5"
+        );
+    let mut statement = connection
+        .prepare(&sql)
         .map_err(|error| format!("读取归档失败：{error}"))?;
     let rows = statement
         .query_map(
-            params![owner_uin, category, limit.clamp(1, 200), offset],
+            params![owner_uin, category, year, limit.clamp(1, 200), offset],
             |row| {
                 let video_json = row.get::<_, Option<String>>(8)?;
                 let video_urls = video_urls(video_json.clone());
@@ -2218,13 +2609,24 @@ pub async fn list_archived_feeds(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("读取归档记录失败：{error}"))?;
     drop(statement);
+    hydrate_archive_item_interactions(&connection, &mut items)?;
+    Ok(items)
+    })
+    .await
+    .map_err(|error| format!("归档查询任务异常退出：{error}"))?
+}
+
+fn hydrate_archive_item_interactions(
+    connection: &Connection,
+    items: &mut [ArchiveItem],
+) -> Result<(), String> {
     let mut comment_statement = connection
         .prepare(
             "SELECT comments_json,actor_uin,actor_name,event_summary,event_time FROM archive_feeds
-         WHERE owner_uin=?1 AND cell_id=?2 AND event_type IN (2,311) ORDER BY event_time ASC",
+             WHERE owner_uin=?1 AND cell_id=?2 AND event_type IN (2,311) ORDER BY event_time ASC",
         )
         .map_err(|error| format!("准备评论查询失败：{error}"))?;
-    for item in &mut items {
+    for item in items.iter_mut() {
         let comments = comment_statement
             .query_map(params![item.owner_uin, item.cell_id], |row| {
                 Ok(comment_from_values(
@@ -2243,10 +2645,10 @@ pub async fn list_archived_feeds(
     let mut like_statement = connection
         .prepare(
             "SELECT actor_uin,actor_name FROM archive_feeds
-         WHERE owner_uin=?1 AND cell_id=?2 AND event_type=217 ORDER BY event_time ASC",
+             WHERE owner_uin=?1 AND cell_id=?2 AND event_type=217 ORDER BY event_time ASC",
         )
         .map_err(|error| format!("准备点赞查询失败：{error}"))?;
-    for item in &mut items {
+    for item in items.iter_mut() {
         let likes = like_statement
             .query_map(params![item.owner_uin, item.cell_id], |row| {
                 Ok(LikeUser {
@@ -2258,10 +2660,36 @@ pub async fn list_archived_feeds(
         item.likes = deduplicate_likes(likes.filter_map(Result::ok));
         item.like_count = item.likes.len() as i64;
     }
-    Ok(items)
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_archive_years(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    category: String,
+) -> Result<Vec<i32>, String> {
+    validate_category(&category)?;
+    let owner_uin = login.qzone_auth().await?.uin;
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = open_database(&app)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT DISTINCT CAST(strftime('%Y',published_at,'unixepoch','localtime') AS INTEGER)
+                 FROM archive_dynamics
+                 WHERE owner_uin=?1 AND category=?2 AND published_at>0
+                 ORDER BY 1 DESC",
+            )
+            .map_err(|error| format!("读取归档年份失败：{error}"))?;
+        let years = statement
+            .query_map(params![owner_uin, category], |row| row.get::<_, i32>(0))
+            .map_err(|error| format!("查询归档年份失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("读取归档年份记录失败：{error}"))?;
+        Ok(years)
     })
     .await
-    .map_err(|error| format!("归档查询任务异常退出：{error}"))?
+    .map_err(|error| format!("归档年份查询任务异常退出：{error}"))?
 }
 
 #[tauri::command]
@@ -2379,18 +2807,20 @@ pub async fn get_archived_feed(
          WHERE owner_uin=?1 AND cell_id=?2 AND event_type IN (2,311) ORDER BY event_time ASC",
         )
         .map_err(|error| format!("准备评论查询失败：{error}"))?;
-    item.comments = merge_comments(comments
-        .query_map(params![item.owner_uin, item.cell_id], |row| {
-            Ok(comment_from_values(
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })
-        .map_err(|error| format!("查询动态评论失败：{error}"))?
-        .filter_map(Result::ok));
+    item.comments = merge_comments(
+        comments
+            .query_map(params![item.owner_uin, item.cell_id], |row| {
+                Ok(comment_from_values(
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .map_err(|error| format!("查询动态评论失败：{error}"))?
+            .filter_map(Result::ok),
+    );
     item.comment_count = comment_interaction_count(&item.comments);
     drop(comments);
     let mut likes_stmt = connection
@@ -2399,16 +2829,18 @@ pub async fn get_archived_feed(
          WHERE owner_uin=?1 AND cell_id=?2 AND event_type=217 ORDER BY event_time ASC",
         )
         .map_err(|error| format!("准备点赞查询失败：{error}"))?;
-    item.likes = deduplicate_likes(likes_stmt
-        .query_map(params![item.owner_uin, item.cell_id], |row| {
-            Ok(LikeUser {
-                uin: row.get(0)?,
-                nickname: row.get(1)?,
+    item.likes = deduplicate_likes(
+        likes_stmt
+            .query_map(params![item.owner_uin, item.cell_id], |row| {
+                Ok(LikeUser {
+                    uin: row.get(0)?,
+                    nickname: row.get(1)?,
+                })
             })
-        })
-        .map_err(|error| format!("查询点赞用户失败：{error}"))?
-        .filter_map(Result::ok)
-        .collect::<Vec<_>>());
+            .map_err(|error| format!("查询点赞用户失败：{error}"))?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>(),
+    );
     item.like_count = item.likes.len() as i64;
     Ok(item)
 }
@@ -2498,10 +2930,25 @@ fn comment_from_values(
         }
     }
 
+    let preferred_name = main_name
+        .clone()
+        .filter(|name| {
+            !name.trim().is_empty() && main_uin.as_deref().map_or(true, |uin| name.trim() != uin)
+        })
+        .or_else(|| {
+            fallback_name.clone().filter(|name| {
+                !name.trim().is_empty()
+                    && fallback_uin
+                        .as_deref()
+                        .map_or(true, |uin| name.trim() != uin)
+            })
+        })
+        .or(main_name)
+        .or(fallback_name);
     ArchiveComment {
         comment_id,
         uin: main_uin.or(fallback_uin),
-        nickname: main_name.or(fallback_name),
+        nickname: preferred_name,
         content: main_content
             .or(fallback_content)
             .unwrap_or_else(|| "评论了这条动态".into()),
@@ -2568,7 +3015,10 @@ fn deduplicate_likes(likes: impl IntoIterator<Item = LikeUser>) -> Vec<LikeUser>
     likes
         .into_iter()
         .filter(|like| {
-            seen.insert((like.uin.clone().unwrap_or_default(), like.nickname.clone().unwrap_or_default()))
+            seen.insert((
+                like.uin.clone().unwrap_or_default(),
+                like.nickname.clone().unwrap_or_default(),
+            ))
         })
         .collect()
 }
@@ -2851,19 +3301,22 @@ pub async fn count_archived_feeds(
     app: tauri::AppHandle,
     login: tauri::State<'_, QLoginState>,
     category: String,
+    year: Option<i32>,
 ) -> Result<u64, String> {
     validate_category(&category)?;
     let owner_uin = login.qzone_auth().await?.uin;
     tauri::async_runtime::spawn_blocking(move || {
-    let connection = open_database(&app)?;
-    connection
-        .query_row(
-            "SELECT COUNT(*) FROM archive_dynamics WHERE owner_uin=?1 AND category=?2",
-            params![owner_uin, category],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|count| count.max(0) as u64)
-        .map_err(|error| format!("统计归档数量失败：{error}"))
+        let connection = open_database(&app)?;
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM archive_dynamics
+                 WHERE owner_uin=?1 AND category=?2
+                   AND (?3 IS NULL OR CAST(strftime('%Y',published_at,'unixepoch','localtime') AS INTEGER)=?3)",
+                params![owner_uin, category, year],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count.max(0) as u64)
+            .map_err(|error| format!("统计归档数量失败：{error}"))
     })
     .await
     .map_err(|error| format!("归档统计任务异常退出：{error}"))?
@@ -3107,12 +3560,77 @@ pub async fn list_interactors(
         .map_err(|error| format!("读取联系人失败：{error}"))
 }
 
+#[tauri::command]
+pub async fn list_contact_comment_threads(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    uin: String,
+) -> Result<Vec<ArchiveItem>, String> {
+    if uin.is_empty() || uin.len() > 32 || !uin.chars().all(|character| character.is_ascii_digit())
+    {
+        return Err("联系人 QQ 号无效".into());
+    }
+    let owner_uin = login.qzone_auth().await?.uin;
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = open_database(&app)?;
+        let pattern = format!("%{uin}%");
+        let mut statement = connection
+            .prepare(
+                "SELECT d.id,d.owner_uin,d.cell_id,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
+                        0,0
+                 FROM archive_dynamics d
+                 WHERE d.owner_uin=?1 AND d.category='self' AND EXISTS (
+                   SELECT 1 FROM archive_feeds f
+                   WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type IN (2,311)
+                     AND (f.actor_uin=?2 OR COALESCE(f.comments_json,'') LIKE ?3)
+                 )
+                 ORDER BY d.published_at DESC,d.id DESC LIMIT 500",
+            )
+            .map_err(|error| format!("准备联系人评论查询失败：{error}"))?;
+        let rows = statement
+            .query_map(params![owner_uin, uin, pattern], |row| {
+                let video_json = row.get::<_, Option<String>>(8)?;
+                let video_urls = video_urls(video_json.clone());
+                Ok(ArchiveItem {
+                    id: row.get(0)?, owner_uin: row.get(1)?, cell_id: row.get(2)?,
+                    published_at: row.get(3)?, content: row.get(4)?, author_uin: row.get(5)?,
+                    author_name: row.get(6)?, picture_urls: picture_urls(row.get(7)?),
+                    video_url: video_urls.first().cloned(), video_urls,
+                    video_cover_url: video_cover_url(video_json), like_count: 0,
+                    comment_count: 0, likes: vec![], comments: vec![],
+                })
+            })
+            .map_err(|error| format!("查询联系人评论失败：{error}"))?;
+        let mut items = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("读取联系人评论失败：{error}"))?;
+        drop(statement);
+        hydrate_archive_item_interactions(&connection, &mut items)?;
+        for item in &mut items {
+            item.comments.retain(|comment| {
+                comment.uin.as_deref() == Some(uin.as_str())
+                    || comment.replies.iter().any(|reply| {
+                        reply.uin.as_deref() == Some(uin.as_str())
+                            || reply.reply_to_uin.as_deref() == Some(uin.as_str())
+                    })
+            });
+            item.comment_count = comment_interaction_count(&item.comments);
+            item.likes.clear();
+            item.like_count = 0;
+        }
+        items.retain(|item| !item.comments.is_empty());
+        Ok(items)
+    })
+    .await
+    .map_err(|error| format!("联系人评论查询任务异常退出：{error}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_feed_cursor, archive_page_delay_ms, checkpoint_is_stale, comment_from_values,
-        merge_comments, parse_feed, parse_feed_cursor, serialize_query_pairs, skip_probe_offsets,
-        ArchiveCheckpoint, FeedCursorDetails,
+        advance_feed_cursor, archive_page_delay_ms, canonical_qzone_cell_id, checkpoint_is_stale,
+        comment_from_values, merge_comments, parse_feed, parse_feed_cursor, serialize_query_pairs,
+        skip_probe_offsets, ArchiveCheckpoint, FeedCursorDetails,
     };
     use serde_json::json;
 
@@ -3361,6 +3879,19 @@ mod tests {
     }
 
     #[test]
+    fn canonicalizes_comment_and_like_aliases_to_one_qzone_mood() {
+        assert_eq!(
+            canonical_qzone_cell_id("b327e67270f89d62e24a0e00.1").as_deref(),
+            Some("b327e67270f89d62e24a0e00")
+        );
+        assert_eq!(
+            canonical_qzone_cell_id("b327e67270f89d62e24a0e00.").as_deref(),
+            Some("b327e67270f89d62e24a0e00")
+        );
+        assert_eq!(canonical_qzone_cell_id("history-v2:abc"), None);
+    }
+
+    #[test]
     fn expires_old_resume_cursor_without_discarding_archive_rows() {
         let checkpoint = ArchiveCheckpoint {
             cursor: "temporary-cursor".into(),
@@ -3451,9 +3982,6 @@ mod tests {
             skip_probe_offsets(1),
             vec![1, 2, 4, 8, 16, 32, 64, 128, 256]
         );
-        assert_eq!(
-            skip_probe_offsets(20),
-            vec![20, 32, 64, 128, 256]
-        );
+        assert_eq!(skip_probe_offsets(20), vec![20, 32, 64, 128, 256]);
     }
 }

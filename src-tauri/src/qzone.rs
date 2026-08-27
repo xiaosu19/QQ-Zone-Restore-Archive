@@ -1,20 +1,26 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use reqwest::header::{
     ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL, COOKIE, ORIGIN, PRAGMA, REFERER, USER_AGENT,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use url::Url;
-use std::sync::{Arc, Mutex};
 
 use crate::qlogin::QLoginState;
 
 const FEEDS_URL: &str = "https://mobile.qzone.qq.com/get_feeds";
 const OWN_MOMENTS_URL: &str =
     "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6";
+const OWN_MOMENTS_FALLBACK_URL: &str =
+    "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_msglist_v6";
 const HISTORY_MESSAGES_URL: &str =
     "https://user.qzone.qq.com/proxy/domain/ic2.qzone.qq.com/cgi-bin/feeds/feeds2_html_pav_all";
+const PORTRAIT_URL: &str = "https://r.qzone.qq.com/fcg-bin/cgi_get_portrait.fcg";
 const DESKTOP_QZONE_USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
 const FEED_RESPONSE_ATTEMPTS: u32 = 3;
@@ -41,17 +47,17 @@ pub struct RecycleAuthState {
 fn pwd2sig_from_url(value: &str) -> Option<String> {
     let url = Url::parse(value).ok()?;
     url.query_pairs().find_map(|(key, value)| {
-        key.eq_ignore_ascii_case("pwd2sig").then(|| value.into_owned())
+        key.eq_ignore_ascii_case("pwd2sig")
+            .then(|| value.into_owned())
     })
 }
 
 #[cfg(windows)]
 fn install_recycle_request_listener(window: &tauri::WebviewWindow, state: RecycleAuthState) {
     use webview2_com::{
-        Microsoft::Web::WebView2::Win32::{
-            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL, ICoreWebView2,
-        },
-        take_pwstr, WebResourceRequestedEventHandler,
+        take_pwstr,
+        Microsoft::Web::WebView2::Win32::{ICoreWebView2, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL},
+        WebResourceRequestedEventHandler,
     };
     use windows::core::{HSTRING, PWSTR};
 
@@ -66,7 +72,9 @@ fn install_recycle_request_listener(window: &tauri::WebviewWindow, state: Recycl
                 COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
             );
             let handler = WebResourceRequestedEventHandler::create(Box::new(move |_, args| {
-                let Some(args) = args else { return Ok(()); };
+                let Some(args) = args else {
+                    return Ok(());
+                };
                 let request = args.Request()?;
                 let mut raw_uri = PWSTR::null();
                 request.Uri(&mut raw_uri)?;
@@ -109,16 +117,24 @@ fn parse_qzone_json(text: &str) -> Result<Value, String> {
     // The response can be an HTML shell containing setup scripts followed by
     // a callback such as `cb({...})`. Try candidate object spans from the end
     // so setup blocks like `try { document.domain = ... }` are ignored.
-    let starts: Vec<usize> = normalized.match_indices('{').map(|(index, _)| index).collect();
+    let starts: Vec<usize> = normalized
+        .match_indices('{')
+        .map(|(index, _)| index)
+        .collect();
     let mut best_with_code: Option<(usize, Value)> = None;
     let mut fallback: Option<Value> = None;
     for &start in starts.iter().rev() {
-        let ends: Vec<usize> = normalized[start..].match_indices('}').map(|(index, _)| start + index + 1).collect();
+        let ends: Vec<usize> = normalized[start..]
+            .match_indices('}')
+            .map(|(index, _)| start + index + 1)
+            .collect();
         for &end in ends.iter().rev().take(80) {
             if let Ok(value) = serde_json::from_str::<Value>(&normalized[start..end]) {
                 let span = end - start;
                 if value.get("code").is_some()
-                    && best_with_code.as_ref().map_or(true, |(best_span, _)| span > *best_span)
+                    && best_with_code
+                        .as_ref()
+                        .map_or(true, |(best_span, _)| span > *best_span)
                 {
                     best_with_code = Some((span, value));
                 } else if fallback.is_none() {
@@ -133,7 +149,10 @@ fn parse_qzone_json(text: &str) -> Result<Value, String> {
     if let Some(value) = fallback {
         return Ok(value);
     }
-    Err(format!("解析 QQ 空间响应失败：响应片段：{}", normalized.chars().take(180).collect::<String>()))
+    Err(format!(
+        "解析 QQ 空间响应失败：响应片段：{}",
+        normalized.chars().take(180).collect::<String>()
+    ))
 }
 
 fn parse_qzone_action_response(text: &str) -> Result<Value, String> {
@@ -144,10 +163,13 @@ fn parse_qzone_action_response(text: &str) -> Result<Value, String> {
 }
 
 fn ensure_qzone_success(value: Value) -> Result<Value, String> {
-    let code = value.get("code").and_then(|code| {
-        code.as_i64()
-            .or_else(|| code.as_str().and_then(|text| text.parse().ok()))
-    }).ok_or("QQ 空间响应缺少 code 字段")?;
+    let code = value
+        .get("code")
+        .and_then(|code| {
+            code.as_i64()
+                .or_else(|| code.as_str().and_then(|text| text.parse().ok()))
+        })
+        .ok_or("QQ 空间响应缺少 code 字段")?;
     if code == 0 {
         return Ok(value);
     }
@@ -221,8 +243,11 @@ pub async fn open_recycle_password_window(
     if let Ok(mut guard) = recycle_state.pwd2sig.lock() {
         *guard = None;
     }
-    let page_url = Url::parse(&format!("https://user.qzone.qq.com/{}/photo/recycle", auth.uin))
-        .map_err(|error| format!("回收站地址无效：{error}"))?;
+    let page_url = Url::parse(&format!(
+        "https://user.qzone.qq.com/{}/photo/recycle",
+        auth.uin
+    ))
+    .map_err(|error| format!("回收站地址无效：{error}"))?;
     let bridge_script = r#"
       (() => {
         const prefix = '__QZA_PWD2SIG__';
@@ -328,9 +353,9 @@ pub async fn open_recycle_password_window(
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.center();
     let window = builder
-    .initialization_script(bridge_script)
-    .build()
-    .map_err(|error| format!("打开独立密码验证窗口失败：{error}"))?;
+        .initialization_script(bridge_script)
+        .build()
+        .map_err(|error| format!("打开独立密码验证窗口失败：{error}"))?;
     #[cfg(windows)]
     install_recycle_request_listener(&window, recycle_state.inner().clone());
     for entry in auth.cookie_header.split("; ") {
@@ -403,9 +428,16 @@ pub async fn check_recycle_password(
     })()"#).ok();
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
     let title = window.title().unwrap_or_default();
-    let current_url = window.url().ok().map(|url| url.to_string()).unwrap_or_default();
+    let current_url = window
+        .url()
+        .ok()
+        .map(|url| url.to_string())
+        .unwrap_or_default();
     let parsed_url = Url::parse(&current_url).ok();
-    if let Some(token) = title.strip_prefix("__QZA_PWD2SIG__").filter(|value| !value.is_empty()) {
+    if let Some(token) = title
+        .strip_prefix("__QZA_PWD2SIG__")
+        .filter(|value| !value.is_empty())
+    {
         return Ok(Some(token.to_owned()));
     }
     if let Ok(cookies) = window.cookies() {
@@ -421,12 +453,24 @@ pub async fn check_recycle_password(
     // 腾讯验证成功后通常会跳转到 callback.html，并把临时签名放在查询串或 hash 中。
     let parsed = parsed_url;
     let token_from_url = parsed.as_ref().and_then(|url| {
-        let from_pairs = |pairs: Vec<(String, String)>| pairs.into_iter().find_map(|(key, value)| {
-            (key.eq_ignore_ascii_case("pwd2sig") || key.eq_ignore_ascii_case("pwd2Sig")).then_some(value)
-        });
-        from_pairs(url.query_pairs().map(|(key, value)| (key.into_owned(), value.into_owned())).collect())
-            .or_else(|| from_pairs(url::form_urlencoded::parse(url.fragment().unwrap_or_default().as_bytes())
-                .map(|(key, value)| (key.into_owned(), value.into_owned())).collect()))
+        let from_pairs = |pairs: Vec<(String, String)>| {
+            pairs.into_iter().find_map(|(key, value)| {
+                (key.eq_ignore_ascii_case("pwd2sig") || key.eq_ignore_ascii_case("pwd2Sig"))
+                    .then_some(value)
+            })
+        };
+        from_pairs(
+            url.query_pairs()
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect(),
+        )
+        .or_else(|| {
+            from_pairs(
+                url::form_urlencoded::parse(url.fragment().unwrap_or_default().as_bytes())
+                    .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                    .collect(),
+            )
+        })
     });
     Ok(token_from_url.filter(|value| !value.is_empty()))
 }
@@ -490,16 +534,42 @@ pub async fn load_recycle_photo_preview(
         return Err("照片缩略图地址不是 QQ 图片域名".into());
     }
     let auth = state.qzone_auth().await?;
-    let response = state.client().get(url)
-        .header(ACCEPT, "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8")
-        .header(REFERER, format!("https://user.qzone.qq.com/{}/photo/recycle", auth.uin))
+    let response = state
+        .client()
+        .get(url)
+        .header(
+            ACCEPT,
+            "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8",
+        )
+        .header(
+            REFERER,
+            format!("https://user.qzone.qq.com/{}/photo/recycle", auth.uin),
+        )
         .header(USER_AGENT, &auth.user_agent)
         .header(COOKIE, &auth.cookie_header)
-        .send().await.map_err(|error| format!("读取照片缩略图失败：{error}"))?;
-    if !response.status().is_success() { return Err(format!("读取照片缩略图失败：HTTP {}", response.status())); }
-    let content_type = response.headers().get("content-type").and_then(|value| value.to_str().ok()).unwrap_or("image/jpeg").split(';').next().unwrap_or("image/jpeg").to_owned();
-    let bytes = response.bytes().await.map_err(|error| format!("读取照片缩略图失败：{error}"))?;
-    Ok(format!("data:{content_type};base64,{}", BASE64.encode(bytes)))
+        .send()
+        .await
+        .map_err(|error| format!("读取照片缩略图失败：{error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("读取照片缩略图失败：HTTP {}", response.status()));
+    }
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("image/jpeg")
+        .split(';')
+        .next()
+        .unwrap_or("image/jpeg")
+        .to_owned();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("读取照片缩略图失败：{error}"))?;
+    Ok(format!(
+        "data:{content_type};base64,{}",
+        BASE64.encode(bytes)
+    ))
 }
 
 #[tauri::command]
@@ -667,13 +737,19 @@ pub async fn recover_recycle_album(
         .header("sec-fetch-dest", "empty")
         .header("sec-fetch-mode", "cors")
         .header("sec-fetch-site", "same-origin")
-        .header("content-type", "application/x-www-form-urlencoded;charset=UTF-8")
+        .header(
+            "content-type",
+            "application/x-www-form-urlencoded;charset=UTF-8",
+        )
         .form(&form)
         .send()
         .await
         .map_err(|error| format!("恢复相册失败：{error}"))?;
     let status = response.status();
-    let text = response.text().await.map_err(|error| format!("读取恢复相册响应失败：{error}"))?;
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("读取恢复相册响应失败：{error}"))?;
     if !status.is_success() {
         return Err(format!("恢复相册失败：HTTP {status}"));
     }
@@ -682,7 +758,9 @@ pub async fn recover_recycle_album(
     let succeeded = data.get("succ_num").and_then(Value::as_u64).unwrap_or(0);
     let failed = data.get("fail_num").and_then(Value::as_u64).unwrap_or(0);
     if succeeded != 1 || failed != 0 {
-        return Err(format!("相册恢复未完成：成功 {succeeded} 个，失败 {failed} 个"));
+        return Err(format!(
+            "相册恢复未完成：成功 {succeeded} 个，失败 {failed} 个"
+        ));
     }
     Ok(parsed)
 }
@@ -699,8 +777,12 @@ pub async fn recover_recycle_photos(
         return Err("请先选择需要恢复的照片".into());
     }
     let auth = state.qzone_auth().await?;
-    if source_album_id.trim().is_empty() { return Err("照片缺少回收站来源相册 ID".into()); }
-    if target_album_id.trim().is_empty() { return Err("照片缺少恢复目标相册 ID".into()); }
+    if source_album_id.trim().is_empty() {
+        return Err("照片缺少回收站来源相册 ID".into());
+    }
+    if target_album_id.trim().is_empty() {
+        return Err("照片缺少恢复目标相册 ID".into());
+    }
     let pic_list = format!("{}@{}", source_album_id, photo_ids.join("_"));
     let g_tk = auth.g_tk.to_string();
     let qzreferrer = format!("https://user.qzone.qq.com/{}", auth.uin);
@@ -710,16 +792,16 @@ pub async fn recover_recycle_photos(
         // Destination album and recycle-bin source group are different IDs.
         ("albumId", target_album_id.as_str()),
         ("picList", pic_list.as_str()),
-            ("pwd2sig", pwd2sig.as_str()),
-            ("format", "fs"),
-            ("inCharset", "utf-8"),
-            ("outCharset", "utf-8"),
-            ("notice", "0"),
-            ("callbackFun", "_Callback"),
-            ("plat", "qzone"),
-            ("source", "qzone"),
-            ("appid", "4"),
-            ("qzreferrer", qzreferrer.as_str()),
+        ("pwd2sig", pwd2sig.as_str()),
+        ("format", "fs"),
+        ("inCharset", "utf-8"),
+        ("outCharset", "utf-8"),
+        ("notice", "0"),
+        ("callbackFun", "_Callback"),
+        ("plat", "qzone"),
+        ("source", "qzone"),
+        ("appid", "4"),
+        ("qzreferrer", qzreferrer.as_str()),
     ];
     let response = state
         .client()
@@ -740,7 +822,10 @@ pub async fn recover_recycle_photos(
         .header("sec-fetch-dest", "empty")
         .header("sec-fetch-mode", "cors")
         .header("sec-fetch-site", "same-origin")
-        .header("content-type", "application/x-www-form-urlencoded;charset=UTF-8")
+        .header(
+            "content-type",
+            "application/x-www-form-urlencoded;charset=UTF-8",
+        )
         .form(&form)
         .send()
         .await
@@ -1015,8 +1100,12 @@ fn append_normalized_replies(
 }
 
 fn visible_moment_as_feeds(moment: &Value, owner_uin: &str, index: usize) -> Vec<Value> {
-    let tid = value_text(moment, &["tid", "id"])
-        .unwrap_or_else(|| format!("visible-{}-{index}", value_number(moment, &["created_time"])));
+    let tid = value_text(moment, &["tid", "id"]).unwrap_or_else(|| {
+        format!(
+            "visible-{}-{index}",
+            value_number(moment, &["created_time"])
+        )
+    });
     let created_at = value_number(moment, &["created_time", "create_time", "date"]);
     let author_uin = value_text(moment, &["uin", "owner_uin"]).unwrap_or_else(|| owner_uin.into());
     let author_name = value_text(moment, &["name", "nickname"]);
@@ -1128,77 +1217,111 @@ pub(crate) async fn fetch_visible_moments(
         ("need_private_comment", "1".into()),
     ];
     let mut last_error = String::new();
-    for attempt in 1..=FEED_RESPONSE_ATTEMPTS {
-        let response = state
-            .client()
-            .get(OWN_MOMENTS_URL)
-            .header(ACCEPT, "*/*")
-            .header(ACCEPT_LANGUAGE, "en-US,en;q=0.9")
-            .header(REFERER, format!("https://user.qzone.qq.com/{}/main", auth.uin))
-            .header(USER_AGENT, DESKTOP_QZONE_USER_AGENT)
-            .header(COOKIE, &auth.desktop_cookie_header)
-            .header("Priority", "u=1, i")
-            .header(
-                "Sec-Ch-Ua",
-                "\"Not;A=Brand\";v=\"24\", \"Chromium\";v=\"128\"",
-            )
-            .header("Sec-Ch-Ua-Mobile", "?0")
-            .header("Sec-Ch-Ua-Platform", "\"Linux\"")
-            .header("Sec-Fetch-Dest", "empty")
-            .header("Sec-Fetch-Mode", "cors")
-            .header("Sec-Fetch-Site", "same-origin")
-            .query(&query)
-            .send()
-            .await;
-        match response {
-            Ok(response) => {
-                let status = response.status();
-                let body = response
-                    .text()
-                    .await
-                    .map_err(|error| format!("读取本人说说响应失败：{error}"))?;
-                if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-                    last_error = format!("HTTP {status}");
-                } else if !status.is_success() {
-                    return Err(format!("获取本人说说失败：HTTP {status}"));
-                } else {
-                    let value = ensure_qzone_success(parse_qzone_json(&body)?)?;
-                    let moments = value
-                        .get("msglist")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    let total = value
-                        .get("total")
-                        .and_then(|value| {
-                            value
-                                .as_u64()
-                                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
-                        })
-                        .unwrap_or((pos as usize + moments.len()) as u64);
-                    let moment_count = moments.len();
-                    let feeds = moments
-                        .iter()
-                        .enumerate()
-                        .flat_map(|(index, moment)| visible_moment_as_feeds(moment, &auth.uin, index))
-                        .collect();
-                    let next_pos = pos.saturating_add(num);
-                    return Ok(VisibleMomentPage {
-                        feeds,
-                        moment_count,
-                        total,
-                        next_pos,
-                        has_more: u64::from(next_pos) < total,
-                    });
+    let mut best_page: Option<VisibleMomentPage> = None;
+    let mut successful_endpoints = 0_u32;
+    for endpoint in [OWN_MOMENTS_URL, OWN_MOMENTS_FALLBACK_URL] {
+        for attempt in 1..=FEED_RESPONSE_ATTEMPTS {
+            let response = state
+                .client()
+                .get(endpoint)
+                .header(ACCEPT, "*/*")
+                .header(ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+                .header(
+                    REFERER,
+                    format!("https://user.qzone.qq.com/{}/main", auth.uin),
+                )
+                .header(USER_AGENT, DESKTOP_QZONE_USER_AGENT)
+                .header(COOKIE, &auth.desktop_cookie_header)
+                .header("Priority", "u=1, i")
+                .header(
+                    "Sec-Ch-Ua",
+                    "\"Not;A=Brand\";v=\"24\", \"Chromium\";v=\"128\"",
+                )
+                .header("Sec-Ch-Ua-Mobile", "?0")
+                .header("Sec-Ch-Ua-Platform", "\"Linux\"")
+                .header("Sec-Fetch-Dest", "empty")
+                .header("Sec-Fetch-Mode", "cors")
+                .header("Sec-Fetch-Site", "same-origin")
+                .query(&query)
+                .send()
+                .await;
+            match response {
+                Ok(response) => {
+                    let status = response.status();
+                    let body = response
+                        .text()
+                        .await
+                        .map_err(|error| format!("读取本人说说响应失败：{error}"))?;
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+                    {
+                        last_error = format!("{endpoint}：HTTP {status}");
+                    } else if !status.is_success() {
+                        last_error = format!("{endpoint}：HTTP {status}");
+                        break;
+                    } else {
+                        match parse_qzone_json(&body).and_then(ensure_qzone_success) {
+                            Ok(value) => {
+                                let moments = value
+                                    .get("msglist")
+                                    .and_then(Value::as_array)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let total = value
+                                    .get("total")
+                                    .and_then(|value| {
+                                        value.as_u64().or_else(|| {
+                                            value.as_str().and_then(|text| text.parse().ok())
+                                        })
+                                    })
+                                    .unwrap_or((pos as usize + moments.len()) as u64);
+                                let moment_count = moments.len();
+                                let feeds = moments
+                                    .iter()
+                                    .enumerate()
+                                    .flat_map(|(index, moment)| {
+                                        visible_moment_as_feeds(moment, &auth.uin, index)
+                                    })
+                                    .collect();
+                                let next_pos = pos.saturating_add(num);
+                                let candidate = VisibleMomentPage {
+                                    feeds,
+                                    moment_count,
+                                    total,
+                                    next_pos,
+                                    has_more: u64::from(next_pos) < total,
+                                };
+                                successful_endpoints = successful_endpoints.saturating_add(1);
+                                let replace = best_page.as_ref().is_none_or(|best| {
+                                    (candidate.total, candidate.moment_count)
+                                        > (best.total, best.moment_count)
+                                });
+                                if replace {
+                                    best_page = Some(candidate);
+                                }
+                                break;
+                            }
+                            Err(error) => {
+                                last_error = format!("{endpoint}：{error}");
+                            }
+                        }
+                    }
                 }
+                Err(error) => last_error = format!("{endpoint}：{error}"),
             }
-            Err(error) => last_error = error.to_string(),
-        }
-        if attempt < FEED_RESPONSE_ATTEMPTS {
-            tokio::time::sleep(feed_retry_delay(attempt)).await;
+            if attempt < FEED_RESPONSE_ATTEMPTS {
+                tokio::time::sleep(feed_retry_delay(attempt)).await;
+            }
         }
     }
-    Err(format!("获取本人说说失败：{last_error}"))
+    match best_page {
+        Some(page) if page.moment_count > 0 || page.total > 0 || successful_endpoints == 2 => {
+            Ok(page)
+        }
+        Some(_) => Err(format!(
+            "获取本人说说失败：一个接口返回空数据，另一个接口不可用（{last_error}）"
+        )),
+        None => Err(format!("获取本人说说失败：{last_error}")),
+    }
 }
 
 fn trailing_qq_number(value: &str) -> Option<String> {
@@ -1272,7 +1395,11 @@ fn parse_history_timestamp(value: &str) -> i64 {
             .and_then(|captures| captures.get(1))
             .and_then(|number| number.as_str().parse::<i64>().ok())
         {
-            return if raw > 10_000_000_000 { raw / 1_000 } else { raw };
+            return if raw > 10_000_000_000 {
+                raw / 1_000
+            } else {
+                raw
+            };
         }
     }
     let full = regex::Regex::new(
@@ -1284,7 +1411,9 @@ fn parse_history_timestamp(value: &str) -> i64 {
     )
     .expect("fixed short history timestamp regex");
     let captures = full.captures(value).or_else(|| short.captures(value));
-    let Some(captures) = captures else { return 0; };
+    let Some(captures) = captures else {
+        return 0;
+    };
     let number = |name: &str| {
         captures
             .name(name)
@@ -1399,6 +1528,30 @@ fn history_element(markup: &str, tag: &str, class_name: &str) -> Option<(String,
     history_elements(markup, tag, class_name).into_iter().next()
 }
 
+fn history_element_by_class(markup: &str, class_name: &str) -> Option<(String, String)> {
+    ["div", "p", "span", "li"]
+        .into_iter()
+        .find_map(|tag| history_element(markup, tag, class_name))
+}
+
+fn history_comment_content(card_body: &str) -> Option<String> {
+    let (_, markup) = history_element_by_class(card_body, "comments-content")
+        .or_else(|| history_element_by_class(card_body, "comments-item"))?;
+    let mut content = history_plain_text(&markup);
+    if let Some(index) = content
+        .char_indices()
+        .find_map(|(index, character)| matches!(character, ':' | '：').then_some(index))
+    {
+        let prefix = content[..index].trim();
+        if !prefix.is_empty() && prefix.chars().count() <= 40 {
+            content = content[index + content[index..].chars().next()?.len_utf8()..]
+                .trim()
+                .to_owned();
+        }
+    }
+    (!content.is_empty()).then_some(content)
+}
+
 fn history_event_key(value: &str) -> Option<(String, i64, i64, i64)> {
     let captures = regex::Regex::new(r"^fct_(\d+)_(\d+)_(\d+)_(\d+)(?:_|$)")
         .expect("fixed history event key regex")
@@ -1412,8 +1565,8 @@ fn history_event_key(value: &str) -> Option<(String, i64, i64, i64)> {
 }
 
 fn history_content_media(card_body: &str) -> Vec<String> {
-    let image_pattern = regex::Regex::new(r"(?is)<img\b(?P<attrs>[^>]*)>")
-        .expect("fixed history image regex");
+    let image_pattern =
+        regex::Regex::new(r"(?is)<img\b(?P<attrs>[^>]*)>").expect("fixed history image regex");
     let mut urls = history_elements(card_body, "a", "img-item")
         .into_iter()
         .flat_map(|(_, body)| {
@@ -1449,16 +1602,29 @@ fn history_content_media(card_body: &str) -> Vec<String> {
 }
 
 fn history_mood_cell_id(card_body: &str, owner_uin: &str) -> Option<String> {
-    let pattern = regex::Regex::new(
-        r#"(?i)(?:https?:)?//user\.qzone\.qq\.com/(\d+)/mood/([^?&"'<>/\s]+)"#,
-    )
-    .expect("fixed Qzone mood URL regex");
+    let pattern =
+        regex::Regex::new(r#"(?i)(?:https?:)?//user\.qzone\.qq\.com/(\d+)/mood/([^?&"'<>/\s]+)"#)
+            .expect("fixed Qzone mood URL regex");
     let cell_id = pattern.captures_iter(card_body).find_map(|captures| {
         (captures.get(1)?.as_str() == owner_uin)
             .then(|| captures.get(2).map(|value| value.as_str().to_owned()))
             .flatten()
     });
-    cell_id
+    cell_id.map(|cell_id| {
+        // The history endpoint emits the same mood as both `tid.` (comments)
+        // and `tid.1` (likes). The regular moment endpoint uses bare `tid`.
+        // Canonicalising those aliases keeps one post with all interactions.
+        let Some((base, suffix)) = cell_id.rsplit_once('.') else {
+            return cell_id;
+        };
+        if !base.is_empty()
+            && (suffix.is_empty() || suffix.chars().all(|character| character.is_ascii_digit()))
+        {
+            base.to_owned()
+        } else {
+            cell_id
+        }
+    })
 }
 
 fn history_original_content(content: &str, owner_name: Option<&str>) -> Option<String> {
@@ -1502,9 +1668,9 @@ fn history_html_as_feeds(
             card.name("attrs")
                 .and_then(|attrs| history_attribute(attrs.as_str(), "class"))
                 .is_some_and(|classes| {
-                    ["f-single", "f-s-s"].iter().all(|required| {
-                        classes.split_whitespace().any(|class| class == *required)
-                    })
+                    ["f-single", "f-s-s"]
+                        .iter()
+                        .all(|required| classes.split_whitespace().any(|class| class == *required))
                 })
         })
         .collect::<Vec<_>>();
@@ -1517,11 +1683,12 @@ fn history_html_as_feeds(
             let stable_id = history_attribute(card_attrs, "data-key")
                 .or_else(|| history_attribute(card_attrs, "id"))?;
             let (actor_uin, family, subtype, key_time) = history_event_key(&stable_id)?;
-            let event_type = match family {
-                217 => 217,
-                311 => 2,
-                _ => return None,
-            };
+            // GetQzonehistory keeps every historical card whose summary belongs
+            // to the current account. Some old publish/share notification
+            // families still contain recoverable post text even though they are
+            // neither a like (217) nor a comment (311). Preserve their original
+            // family number instead of silently dropping the whole post.
+            let event_type = if family == 311 { 2 } else { family };
             let people = history_elements(card_body, "a", "q_namecard")
                 .into_iter()
                 .filter_map(|(attrs, body)| {
@@ -1538,6 +1705,20 @@ fn history_html_as_feeds(
                 .find(|(uin, _)| uin == &actor_uin)
                 .map(|(_, name)| name.clone())
                 .filter(|name| !name.is_empty())
+                // The legacy endpoint sometimes puts the operator UIN only in
+                // the card key while the first visible name card still carries
+                // the correct nickname. This mirrors GetQzonehistory's parser.
+                .or_else(|| {
+                    history_element(card_body, "a", "f-name")
+                        .map(|(_, body)| history_plain_text(&body))
+                        .filter(|name| !name.is_empty())
+                })
+                .or_else(|| {
+                    people
+                        .iter()
+                        .map(|(_, name)| name.clone())
+                        .find(|name| !name.is_empty())
+                })
                 .unwrap_or_else(|| actor_uin.clone());
             let (_, content_markup) = history_element(card_body, "p", "txt-box-title")?;
             let content = history_original_content(&history_plain_text(&content_markup), owner_name)?;
@@ -1568,12 +1749,17 @@ fn history_html_as_feeds(
                 .iter()
                 .find(|(uin, _)| uin != &actor_uin && uin != owner_uin)
                 .map(|(_, name)| name.as_str());
+            let comment_content = (event_type == 2)
+                .then(|| history_comment_content(card_body))
+                .flatten();
             let event_summary = match event_type {
                 217 => "点赞了这条说说".to_owned(),
-                _ if subtype == 14 || subtype == 35 => target_name
+                2 if comment_content.is_some() => comment_content.clone().unwrap_or_default(),
+                2 if subtype == 14 || subtype == 35 => target_name
                     .map(|name| format!("回复了 {name}（旧历史接口未保留回复正文）"))
                     .unwrap_or_else(|| "历史回复（旧历史接口未保留回复正文）".to_owned()),
-                _ => "历史评论（旧历史接口未保留评论正文）".to_owned(),
+                2 => "历史评论（旧历史接口未保留评论正文）".to_owned(),
+                _ => "历史动态残留".to_owned(),
             };
             let comments = (event_type == 2).then(|| {
                 json!({
@@ -1598,7 +1784,11 @@ fn history_html_as_feeds(
                     "cell_id": { "cellid": cell_id },
                     "cell_comm": {
                         "appid": 311,
-                        "time": 0,
+                        // Deleted moods no longer expose their authoritative
+                        // publish time. The oldest surviving interaction time
+                        // is still a useful lower-fidelity fallback and matches
+                        // the recovery timestamp used by GetQzonehistory.
+                        "time": event_time,
                         "feedskey": format!("history-v2-original:{:016x}", history_record_hash(&[owner_uin, &content, &joined_media])),
                     },
                     "cell_userinfo": { "user": { "uin": owner_uin, "nickname": owner_name } },
@@ -1619,6 +1809,9 @@ pub(crate) async fn fetch_history_messages(
     owner_name: Option<&str>,
 ) -> Result<HistoryMessagePage, String> {
     let auth = state.qzone_auth().await?;
+    // The endpoint accepts a larger count while probing, but in live responses
+    // it can return an empty body for count=100. Thirty is the largest window
+    // we have verified to return the actual notification cards reliably.
     let count = count.clamp(1, 30);
     let query = vec![
         ("uin", auth.uin.clone()),
@@ -1697,6 +1890,72 @@ pub(crate) async fn fetch_history_messages(
     Err(format!("获取历史消息失败：{last_error}"))
 }
 
+fn parse_portrait_names(bytes: &[u8]) -> Result<HashMap<String, String>, String> {
+    let (decoded, _, _) = encoding_rs::GBK.decode(bytes);
+    let value = parse_qzone_json(&decoded)?;
+    let Some(entries) = value.as_object() else {
+        return Err("昵称接口响应格式异常".into());
+    };
+    Ok(entries
+        .iter()
+        .filter(|(uin, _)| uin.chars().all(|character| character.is_ascii_digit()))
+        .filter_map(|(uin, profile)| {
+            let nickname = profile
+                .as_array()
+                .and_then(|values| values.get(6))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|nickname| !nickname.is_empty())?;
+            Some((uin.clone(), nickname.to_owned()))
+        })
+        .collect())
+}
+
+pub(crate) async fn fetch_portrait_names(
+    state: &QLoginState,
+    uins: impl IntoIterator<Item = String>,
+) -> Result<HashMap<String, String>, String> {
+    let auth = state.qzone_auth().await?;
+    let mut unique = uins
+        .into_iter()
+        .filter(|uin| !uin.is_empty() && uin.chars().all(|character| character.is_ascii_digit()))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    unique.sort();
+    let mut names = HashMap::new();
+    for batch in unique.chunks(50) {
+        let response = state
+            .client()
+            .get(PORTRAIT_URL)
+            .header(
+                ACCEPT,
+                "application/javascript, application/json, text/plain, */*",
+            )
+            .header(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9")
+            .header(
+                REFERER,
+                format!("https://user.qzone.qq.com/{}/main", auth.uin),
+            )
+            .header(USER_AGENT, DESKTOP_QZONE_USER_AGENT)
+            .header(COOKIE, &auth.desktop_cookie_header)
+            .query(&[("uins", batch.join(",")), ("g_tk", auth.g_tk.to_string())])
+            .send()
+            .await
+            .map_err(|error| format!("补全 QQ 昵称失败：{error}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("补全 QQ 昵称失败：HTTP {status}"));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| format!("读取 QQ 昵称响应失败：{error}"))?;
+        names.extend(parse_portrait_names(&bytes)?);
+    }
+    Ok(names)
+}
+
 fn parse_feed_page(value: Value) -> Result<FeedPage, String> {
     if let Some(code) = value.get("code").and_then(Value::as_i64) {
         if code != 0 {
@@ -1745,8 +2004,7 @@ pub(crate) async fn fetch_feeds_once(
 }
 
 pub(crate) fn feed_error_can_skip(error: &str) -> bool {
-    !feed_error_is_transient(error)
-        && error.starts_with("QQ 空间动态接口返回错误")
+    !feed_error_is_transient(error) && error.starts_with("QQ 空间动态接口返回错误")
 }
 
 pub(crate) fn feed_error_is_transient(error: &str) -> bool {
@@ -1810,7 +2068,10 @@ async fn fetch_feeds_with_attempts(
         match client
             .get(FEEDS_URL)
             .header(ACCEPT, "application/json")
-            .header(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5")
+            .header(
+                ACCEPT_LANGUAGE,
+                "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5",
+            )
             .header(CACHE_CONTROL, "no-cache")
             .header(PRAGMA, "no-cache")
             .header(ORIGIN, "https://h5.qzone.qq.com")
@@ -2003,8 +2264,8 @@ pub async fn fetch_more_feeds(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_history_html, ensure_qzone_success, feed_error_can_skip,
-        feed_error_is_transient, history_html_as_feeds, parse_feed_page, parse_qzone_json,
+        decode_history_html, ensure_qzone_success, feed_error_can_skip, feed_error_is_transient,
+        history_html_as_feeds, parse_feed_page, parse_portrait_names, parse_qzone_json,
         retryable_response_reason, visible_moment_as_feeds, FEEDS_URL,
     };
     use reqwest::StatusCode;
@@ -2068,7 +2329,10 @@ mod tests {
 
     #[test]
     fn parses_qzone_callback_response() {
-        let value = parse_qzone_json(r#"<script>frameElement.callback({"code":0,"data":{"succ_num":1}});</script>"#).unwrap();
+        let value = parse_qzone_json(
+            r#"<script>frameElement.callback({"code":0,"data":{"succ_num":1}});</script>"#,
+        )
+        .unwrap();
         assert_eq!(value["code"], 0);
         assert_eq!(value["data"]["succ_num"], 1);
         assert!(ensure_qzone_success(value).is_ok());
@@ -2143,15 +2407,23 @@ mod tests {
 
     #[test]
     fn classifies_history_notifications_and_filters_decorative_media() {
-        let response = r#"_Callback({html:'\x3Cli class="f-single f-s-s" data-key="fct_20001_217_3_1627745220_1_1"\x3E\x3Ca class="f-name q_namecard" link="nameCard_20001"\x3E好友甲\x3C/a\x3E\x3Ca href="//user.qzone.qq.com/10001/mood/moment-1"\x3E查看说说\x3C/a\x3E\x3Cdiv class="info-detail" data-time="1627745220"\x3E2021年7月31日 23:27\x3C/div\x3E\x3Cp class="txt-box-title ellipsis-one"\x3E本人：\t\t一条历史说说\x3C/p\x3E\x3Cimg src="//qlogo2.store.qq.com/qzone/20001/20001/50"\x3E\x3Ca class="img-item"\x3E\x3Cimg src="//a1.qpic.cn/old.jpg"\x3E\x3C/a\x3E\x3C/li\x3E\x3Cli class="f-single f-s-s" data-key="fct_30001_311_14_1627745320_1_1"\x3E\x3Ca class="f-name q_namecard" link="nameCard_30001"\x3E好友乙\x3C/a\x3E\x3Ca href="//user.qzone.qq.com/10001/mood/moment-1"\x3E查看说说\x3C/a\x3E\x3Cdiv class="info-detail" data-time="1627745320"\x3E2021年7月31日 23:28\x3C/div\x3E\x3Cp class="txt-box-title ellipsis-one"\x3E本人：一条历史说说\x3C/p\x3E\x3C/li\x3E\x3Cli class="f-single f-s-s" data-key="fct_40001_333_15_1627745420_1_1"\x3E\x3Cp class="txt-box-title ellipsis-one"\x3E本人：系统通知\x3C/p\x3E\x3C/li\x3E',opuin:'10001'});"#;
+        let response = r#"_Callback({html:'\x3Cli class="f-single f-s-s" data-key="fct_20001_217_3_1627745220_1_1"\x3E\x3Ca class="f-name q_namecard" link="nameCard_20001"\x3E好友甲\x3C/a\x3E\x3Ca href="//user.qzone.qq.com/10001/mood/moment-1"\x3E查看说说\x3C/a\x3E\x3Cdiv class="info-detail" data-time="1627745220"\x3E2021年7月31日 23:27\x3C/div\x3E\x3Cp class="txt-box-title ellipsis-one"\x3E本人：\t\t一条历史说说\x3C/p\x3E\x3Cimg src="//qlogo2.store.qq.com/qzone/20001/20001/50"\x3E\x3Ca class="img-item"\x3E\x3Cimg src="//a1.qpic.cn/old.jpg"\x3E\x3C/a\x3E\x3C/li\x3E\x3Cli class="f-single f-s-s" data-key="fct_30001_311_14_1627745320_1_1"\x3E\x3Ca class="f-name q_namecard" link="nameCard_99999"\x3E好友乙\x3C/a\x3E\x3Ca href="//user.qzone.qq.com/10001/mood/moment-1"\x3E查看说说\x3C/a\x3E\x3Cdiv class="info-detail" data-time="1627745320"\x3E2021年7月31日 23:28\x3C/div\x3E\x3Cp class="txt-box-title ellipsis-one"\x3E本人：一条历史说说\x3C/p\x3E\x3Cdiv class="comments-content"\x3E好友乙：这是评论正文\x3C/div\x3E\x3C/li\x3E\x3Cli class="f-single f-s-s" data-key="fct_40001_333_15_1627745420_1_1"\x3E\x3Cp class="txt-box-title ellipsis-one"\x3E本人：系统通知\x3C/p\x3E\x3C/li\x3E',opuin:'10001'});"#;
         let html = decode_history_html(response).expect("应解码旧历史消息 HTML");
         let (scanned, feeds) = history_html_as_feeds(&html, "10001", Some("本人"), 0);
         assert_eq!(scanned, 3);
-        assert_eq!(feeds.len(), 2);
+        assert_eq!(feeds.len(), 3);
         assert_eq!(feeds[0]["comm"]["subid"], 217);
         assert_eq!(feeds[1]["comm"]["subid"], 2);
+        assert_eq!(feeds[2]["comm"]["subid"], 333);
+        assert_eq!(feeds[2]["original"]["cell_summary"]["summary"], "系统通知");
         assert_eq!(feeds[0]["userinfo"]["user"]["uin"], "20001");
         assert_eq!(feeds[1]["userinfo"]["user"]["uin"], "30001");
+        assert_eq!(feeds[1]["userinfo"]["user"]["nickname"], "好友乙");
+        assert_eq!(feeds[1]["summary"]["summary"], "这是评论正文");
+        assert_eq!(
+            feeds[1]["original"]["cell_comment"]["main_comment"]["content"],
+            "这是评论正文"
+        );
         assert_eq!(feeds[0]["original"]["cell_id"]["cellid"], "moment-1");
         assert_eq!(feeds[1]["original"]["cell_id"]["cellid"], "moment-1");
         assert_eq!(
@@ -2174,11 +2446,19 @@ mod tests {
             1
         );
         assert_eq!(feeds[0]["comm"]["time"], 1_627_745_220);
-        assert_eq!(feeds[0]["original"]["cell_comm"]["time"], 0);
+        assert_eq!(feeds[0]["original"]["cell_comm"]["time"], 1_627_745_220);
         assert!(!feeds[0]["original"]["cell_summary"]["summary"]
             .as_str()
             .unwrap()
             .contains("\\t"));
+    }
+
+    #[test]
+    fn decodes_gbk_portrait_names() {
+        let (encoded, _, _) =
+            encoding_rs::GBK.encode(r#"portraitCallBack({"20001":["avatar",0,0,0,0,0,"好友甲"]})"#);
+        let names = parse_portrait_names(&encoded).expect("应解析 GBK 昵称响应");
+        assert_eq!(names.get("20001").map(String::as_str), Some("好友甲"));
     }
 
     #[test]

@@ -9,9 +9,10 @@ import Checkbox from "primevue/checkbox";
 import Dialog from "primevue/dialog";
 import InputText from "primevue/inputtext";
 import Paginator, { type PageState } from "primevue/paginator";
+import Select from "primevue/select";
 import QzoneText from "../components/QzoneText.vue";
 import { loadRemoteImageBlob } from "../utils/archiveImage";
-import { clearArchivedFeeds, countArchivedFeeds, deleteArchivedFeeds, exportArchivedHtml, listArchivedFeeds, loadArchivedImage, loadArchivedVideo, type ArchiveCategory, type ArchiveItem } from "../utils/qzone";
+import { clearArchivedFeeds, countArchivedFeeds, deleteArchivedFeeds, exportArchivedHtml, listArchivedFeeds, listArchiveYears, loadArchivedImage, loadArchivedVideo, type ArchiveCategory, type ArchiveItem } from "../utils/qzone";
 
 type DeleteAction = "selected" | "all";
 const records = ref<ArchiveItem[]>([]);
@@ -27,6 +28,14 @@ const first = ref(0);
 const pageSize = ref(20);
 const totalRecords = ref(0);
 const category = ref<ArchiveCategory>("self");
+const years = ref<number[]>([]);
+const selectedYear = ref(0);
+const descending = ref(true);
+const yearOptions = computed(() => [{ label: "全部年份", value: 0 }, ...years.value.map((year) => ({ label: `${year} 年`, value: year }))]);
+const orderOptions = [
+  { label: "时间从新到旧", value: true },
+  { label: "时间从旧到新", value: false },
+];
 const categoryOptions: { label: string; value: ArchiveCategory; icon: string; hint: string }[] = [
   { label: "本人动态", value: "self", icon: "pi pi-user", hint: "由当前账号发布" },
   { label: "其他动态", value: "other", icon: "pi pi-users", hint: "好友及其他用户" },
@@ -74,8 +83,15 @@ async function load() {
   releaseVideos();
   loading.value = true; error.value = "";
   try {
-    const [items, total] = await Promise.all([listArchivedFeeds(pageSize.value, first.value, category.value), countArchivedFeeds(category.value)]);
+    const year = selectedYear.value || undefined;
+    const [items, total, availableYears] = await Promise.all([
+      listArchivedFeeds(pageSize.value, first.value, category.value, year, descending.value),
+      countArchivedFeeds(category.value, year),
+      listArchiveYears(category.value),
+    ]);
     records.value = items; totalRecords.value = total; selectedIds.value = []; avatarTimestamp.value = Date.now();
+    years.value = availableYears;
+    if (selectedYear.value && !availableYears.includes(selectedYear.value)) selectedYear.value = 0;
     if (!items.length && first.value > 0 && total > 0) { first.value = Math.max(0, Math.floor((total - 1) / pageSize.value) * pageSize.value); await load(); }
     else { await nextTick(); observeArchiveImages(); }
   }
@@ -252,7 +268,8 @@ async function confirmDelete() {
   finally { deleting.value = false; }
 }
 onMounted(load);
-watch(category, () => { first.value = 0; query.value = ""; void load(); });
+watch(category, () => { first.value = 0; query.value = ""; selectedYear.value = 0; void load(); });
+watch([selectedYear, descending], () => { first.value = 0; void load(); });
 onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVideos(); });
 </script>
 
@@ -281,6 +298,10 @@ onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVi
     <div class="archive-toolbar-divider" />
     <div class="archive-control-bar">
       <div class="search-box"><i class="pi pi-search" /><InputText v-model="query" placeholder="搜索内容、用户或 QQ 号" /></div>
+      <div class="archive-filter-controls">
+        <Select v-model="selectedYear" :options="yearOptions" option-label="label" option-value="value" aria-label="按年份筛选" />
+        <Select v-model="descending" :options="orderOptions" option-label="label" option-value="value" aria-label="时间排序" />
+      </div>
       <div v-if="records.length" class="selection-controls">
         <Button :label="allVisibleSelected ? '取消全选' : '全选'" icon="pi pi-check-square" severity="secondary" outlined size="small" @click="toggleVisible" />
         <span v-if="selectedIds.length" class="selection-count">已选 {{ selectedIds.length }} 条</span>
@@ -322,11 +343,11 @@ onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVi
         <section v-if="item.comments.length" class="archive-comments">
           <div v-for="comment in (expandedComments.has(item.id) ? item.comments : item.comments.slice(0, 3))" :key="`${comment.uin}-${comment.createdAt}-${comment.content}`" class="archive-comment">
             <span class="comment-avatar"><img v-if="comment.uin" :src="avatarUrl(comment.uin)" loading="lazy" referrerpolicy="no-referrer" /><i v-else class="pi pi-user" /></span>
-            <div class="archive-comment-body"><div class="archive-comment-meta"><strong>{{ comment.nickname || comment.uin || "QQ 用户" }}</strong><span>评论于</span><time>{{ formatTime(comment.createdAt) }}</time></div><p><QzoneText :value="comment.content" /></p>
+            <div class="archive-comment-body"><div class="archive-comment-meta"><strong :title="comment.uin ? `QQ ${comment.uin}` : undefined">{{ comment.nickname || comment.uin || "QQ 用户" }}</strong><span>评论于</span><time>{{ formatTime(comment.createdAt) }}</time></div><p><QzoneText :value="comment.content" /></p>
               <div v-if="comment.replies.length" class="archive-comment-replies">
                 <div v-for="(reply, replyIndex) in comment.replies" :key="`${reply.uin}-${reply.createdAt}-${replyIndex}`" class="archive-reply">
                   <span class="reply-avatar"><img v-if="reply.uin" :src="avatarUrl(reply.uin)" loading="lazy" referrerpolicy="no-referrer" /><i v-else class="pi pi-user" /></span>
-                  <div><div class="archive-comment-meta"><strong>{{ reply.nickname || reply.uin || "QQ 用户" }}</strong><span>回复 {{ reply.replyToNickname || reply.replyToUin || comment.nickname || comment.uin || "QQ 用户" }}</span><time>{{ formatTime(reply.createdAt) }}</time></div><p><QzoneText :value="reply.content" /></p></div>
+                  <div><div class="archive-comment-meta"><strong :title="reply.uin ? `QQ ${reply.uin}` : undefined">{{ reply.nickname || reply.uin || "QQ 用户" }}</strong><span>回复 {{ reply.replyToNickname || reply.replyToUin || comment.nickname || comment.uin || "QQ 用户" }}</span><time>{{ formatTime(reply.createdAt) }}</time></div><p><QzoneText :value="reply.content" /></p></div>
                 </div>
               </div>
             </div>

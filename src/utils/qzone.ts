@@ -38,10 +38,11 @@ export const getArchiveProgress = () => invoke<ArchiveProgress>("get_archive_pro
 export const cancelFeedArchive = () => invoke<void>("cancel_feed_archive");
 export const listArchiveSkips = () => invoke<ArchiveSkipItem[]>("list_archive_skips");
 export const retryArchiveSkip = (id: number) => invoke<ArchiveSkipRetryResult>("retry_archive_skip", { id });
-export const listArchivedFeeds = (limit = 100, offset = 0, category: ArchiveCategory = "self") => invoke<ArchiveItem[]>("list_archived_feeds", { limit, offset, category });
+export const listArchivedFeeds = (limit = 100, offset = 0, category: ArchiveCategory = "self", year?: number, descending = true) => invoke<ArchiveItem[]>("list_archived_feeds", { limit, offset, category, year, descending });
+export const listArchiveYears = (category: ArchiveCategory = "self") => invoke<number[]>("list_archive_years", { category });
 export const listArchivedMedia = (limit = 60, offset = 0, year?: number) => invoke<ArchiveMediaPage>("list_archived_media", { limit, offset, year });
 export const getArchivedFeed = (id: number) => invoke<ArchiveItem>("get_archived_feed", { id });
-export const countArchivedFeeds = (category: ArchiveCategory = "self") => invoke<number>("count_archived_feeds", { category });
+export const countArchivedFeeds = (category: ArchiveCategory = "self", year?: number) => invoke<number>("count_archived_feeds", { category, year });
 export const exportArchivedHtml = (category: ArchiveCategory, ids?: number[]) => invoke<string>("export_archived_html", { category, ids });
 export const loadArchivedImage = (id: number, pictureIndex: number) => invoke<string>("load_archived_image", { id, pictureIndex });
 export const loadArchivedVideo = (id: number) => invoke<string>("load_archived_video", { id });
@@ -49,6 +50,7 @@ export interface ArchiveOverview { dynamics: number; pictures: number; comments:
 export const getArchiveOverview = () => invoke<ArchiveOverview>("get_archive_overview");
 export interface Interactor { uin: string; nickname: string; likes: number; comments: number; total: number; lastAt: number; }
 export const listInteractors = () => invoke<Interactor[]>("list_interactors");
+export const listContactCommentThreads = (uin: string) => invoke<ArchiveItem[]>("list_contact_comment_threads", { uin });
 export interface InteractionRank { uin: string; nickname: string; interactions: number; likes: number; comments: number; }
 export const getInteractionRanking = (limit = 8) => invoke<InteractionRank[]>("get_interaction_ranking", { limit });
 export const deleteArchivedFeeds = (ids: number[]) => invoke<number>("delete_archived_feeds", { ids });

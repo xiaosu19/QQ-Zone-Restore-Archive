@@ -1,15 +1,22 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import Button from "primevue/button";
+import Dialog from "primevue/dialog";
 import InputText from "primevue/inputtext";
 import Select from "primevue/select";
-import { listInteractors, type Interactor } from "../utils/qzone";
+import QzoneText from "../components/QzoneText.vue";
+import { listContactCommentThreads, listInteractors, type ArchiveItem, type Interactor } from "../utils/qzone";
 
 const contacts = ref<Interactor[]>([]);
 const loading = ref(false);
 const error = ref("");
 const query = ref("");
 const sortBy = ref<"total" | "likes" | "comments" | "lastAt">("total");
+const selectedContact = ref<Interactor>();
+const commentThreads = ref<ArchiveItem[]>([]);
+const commentsVisible = ref(false);
+const commentsLoading = ref(false);
+const commentsError = ref("");
 
 type SortOption = { label: string; value: typeof sortBy.value };
 const sortOptions: SortOption[] = [
@@ -47,6 +54,22 @@ const formatTime = (seconds: number) =>
         new Date(seconds * 1000),
       )
     : "";
+
+async function openComments(contact: Interactor) {
+  if (!contact.comments) return;
+  selectedContact.value = contact;
+  commentsVisible.value = true;
+  commentsLoading.value = true;
+  commentsError.value = "";
+  commentThreads.value = [];
+  try {
+    commentThreads.value = await listContactCommentThreads(contact.uin);
+  } catch (reason) {
+    commentsError.value = String(reason);
+  } finally {
+    commentsLoading.value = false;
+  }
+}
 
 async function load() {
   loading.value = true;
@@ -127,7 +150,7 @@ onMounted(load);
           >
           <div class="contact-stats">
             <span title="点赞"><i class="pi pi-heart" />{{ c.likes }}</span>
-            <span title="评论"><i class="pi pi-comment" />{{ c.comments }}</span>
+            <button type="button" class="contact-comment-link" :disabled="!c.comments" :title="c.comments ? `查看与 ${c.nickname || c.uin} 的全部评论` : '暂无评论'" @click="openComments(c)"><i class="pi pi-comment" />{{ c.comments }}</button>
             <span title="最后互动">{{ formatTime(c.lastAt) }}</span>
           </div>
         </div>
@@ -143,5 +166,32 @@ onMounted(load);
       <h2>{{ query ? "没有匹配的联系人" : "暂无联系人数据" }}</h2>
       <p>{{ query ? "尝试更换搜索关键词。" : "请先前往任务页执行归档，归档后这里会显示与你互动过的联系人。" }}</p>
     </section>
+
+    <Dialog v-model:visible="commentsVisible" modal :draggable="false" class="contact-comments-dialog" :header="`${selectedContact?.nickname || selectedContact?.uin || '联系人'} · 评论往来`">
+      <div v-if="commentsLoading" class="contacts-loading"><i class="pi pi-spin pi-spinner" /><p>正在整理评论记录…</p></div>
+      <p v-else-if="commentsError" class="archive-error"><i class="pi pi-exclamation-circle" />{{ commentsError }}</p>
+      <div v-else-if="commentThreads.length" class="contact-comment-threads">
+        <article v-for="item in commentThreads" :key="item.id" class="contact-comment-thread">
+          <header><time>{{ formatTime(item.publishedAt) || "时间未知" }}</time><span>{{ item.commentCount }} 次评论互动</span></header>
+          <p class="contact-thread-content"><QzoneText :value="item.content || '（原说说无文字内容）'" /></p>
+          <div class="archive-comments">
+            <div v-for="comment in item.comments" :key="`${comment.uin}-${comment.createdAt}-${comment.content}`" class="archive-comment">
+              <span class="comment-avatar"><img v-if="comment.uin" :src="`https://qlogo2.store.qq.com/qzone/${comment.uin}/${comment.uin}/50`" loading="lazy" referrerpolicy="no-referrer" /><i v-else class="pi pi-user" /></span>
+              <div class="archive-comment-body">
+                <div class="archive-comment-meta"><strong :title="comment.uin ? `QQ ${comment.uin}` : undefined">{{ comment.nickname || comment.uin || "QQ 用户" }}</strong><span>评论于</span><time>{{ formatTime(comment.createdAt) || "时间未知" }}</time></div>
+                <p><QzoneText :value="comment.content" /></p>
+                <div v-if="comment.replies.length" class="archive-comment-replies">
+                  <div v-for="(reply, index) in comment.replies" :key="`${reply.uin}-${reply.createdAt}-${index}`" class="archive-reply">
+                    <span class="reply-avatar"><img v-if="reply.uin" :src="`https://qlogo2.store.qq.com/qzone/${reply.uin}/${reply.uin}/50`" loading="lazy" referrerpolicy="no-referrer" /><i v-else class="pi pi-user" /></span>
+                    <div><div class="archive-comment-meta"><strong :title="reply.uin ? `QQ ${reply.uin}` : undefined">{{ reply.nickname || reply.uin || "QQ 用户" }}</strong><span>回复 {{ reply.replyToNickname || reply.replyToUin || comment.nickname || comment.uin || "QQ 用户" }}</span><time>{{ formatTime(reply.createdAt) || "时间未知" }}</time></div><p><QzoneText :value="reply.content" /></p></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </article>
+      </div>
+      <section v-else class="empty-state page-empty"><span><i class="pi pi-comment" /></span><h2>没有可还原的评论正文</h2><p>联系人计数可能来自仅保留互动痕迹的旧接口。</p></section>
+    </Dialog>
   </div>
 </template>

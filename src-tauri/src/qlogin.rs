@@ -283,7 +283,10 @@ fn desktop_cookie_header(cookies: &HashMap<String, String>) -> String {
         .unwrap_or_default();
     [
         ("uin", p_uin),
-        ("skey", cookies.get("skey").map(String::as_str).unwrap_or_default()),
+        (
+            "skey",
+            cookies.get("skey").map(String::as_str).unwrap_or_default(),
+        ),
         ("p_uin", p_uin),
         (
             "pt4_token",
@@ -411,13 +414,17 @@ async fn warmup_qzone_session(
     if !cookies.contains_key("ptui_loginuin") {
         cookies.insert("ptui_loginuin".into(), uin.to_owned());
     }
-    cookies.entry("QZ_FE_WEBP_SUPPORT".to_owned())
+    cookies
+        .entry("QZ_FE_WEBP_SUPPORT".to_owned())
         .or_insert_with(|| "1".into());
-    cookies.entry("cpu_performance_v8".to_owned())
+    cookies
+        .entry("cpu_performance_v8".to_owned())
         .or_insert_with(|| "0".into());
-    cookies.entry("__Q_w_s_hat_seed".to_owned())
+    cookies
+        .entry("__Q_w_s_hat_seed".to_owned())
         .or_insert_with(|| "1".into());
-    cookies.entry("domainid".to_owned())
+    cookies
+        .entry("domainid".to_owned())
         .or_insert_with(|| "5".into());
 }
 
@@ -458,48 +465,63 @@ pub async fn start_qr_login(state: tauri::State<'_, QLoginState>) -> Result<QrLo
     cookies.insert("_qimei_fingerprint".into(), random_hex(32));
     cookies.insert("_qimei_uuid42".into(), random_hex(42));
     cookies.insert("_qimei_i_3".into(), random_hex(87));
-    cookies.insert("_qimei_h38".into(), format!("{}0{}", random_hex(25), random_hex(12)));
+    cookies.insert(
+        "_qimei_h38".into(),
+        format!("{}0{}", random_hex(25), random_hex(12)),
+    );
     cookies.insert("_qimei_i_1".into(), random_hex(97));
     cookies.insert(
         "_qpsvr_localtk".into(),
         format!("{:.16}", unix_millis() as f64 / 1e18),
     );
     // 浏览器追踪 Cookie（优先使用服务端返回值，仅作 fallback）
-    cookies.entry("RK".to_owned())
+    cookies
+        .entry("RK".to_owned())
         .or_insert_with(|| random_alphanum(10));
-    cookies.entry("ptcz".to_owned())
+    cookies
+        .entry("ptcz".to_owned())
         .or_insert_with(|| random_hex(64));
     let ts = unix_millis();
-    cookies.entry("pgv_pvid".to_owned())
+    cookies
+        .entry("pgv_pvid".to_owned())
         .or_insert_with(|| format!("{}", ts % 9_000_000_000 + 1_000_000_000));
-    cookies.entry("pgv_info".to_owned())
+    cookies
+        .entry("pgv_info".to_owned())
         .or_insert_with(|| format!("ssid=s{}", ts));
-    cookies.entry("QZ_FE_WEBP_SUPPORT".to_owned())
+    cookies
+        .entry("QZ_FE_WEBP_SUPPORT".to_owned())
         .or_insert_with(|| "1".into());
-    cookies.entry("cpu_performance_v8".to_owned())
+    cookies
+        .entry("cpu_performance_v8".to_owned())
         .or_insert_with(|| "0".into());
-    cookies.entry("__Q_w_s_hat_seed".to_owned())
+    cookies
+        .entry("__Q_w_s_hat_seed".to_owned())
         .or_insert_with(|| "1".into());
-    cookies.entry("domainid".to_owned())
+    cookies
+        .entry("domainid".to_owned())
         .or_insert_with(|| "5".into());
-    cookies.entry("fqm_pvqid".to_owned())
-        .or_insert_with(|| format!(
+    cookies.entry("fqm_pvqid".to_owned()).or_insert_with(|| {
+        format!(
             "{}-{}-{}-{}-{}",
             random_hex(8),
             random_hex(4),
             random_hex(4),
             random_hex(4),
             random_hex(12)
-        ));
-    cookies.entry("fqm_sessionid".to_owned())
-        .or_insert_with(|| format!(
-            "{}-{}-{}-{}-{}",
-            random_hex(8),
-            random_hex(4),
-            random_hex(4),
-            random_hex(4),
-            random_hex(12)
-        ));
+        )
+    });
+    cookies
+        .entry("fqm_sessionid".to_owned())
+        .or_insert_with(|| {
+            format!(
+                "{}-{}-{}-{}-{}",
+                random_hex(8),
+                random_hex(4),
+                random_hex(4),
+                random_hex(4),
+                random_hex(12)
+            )
+        });
     let image = response
         .bytes()
         .await

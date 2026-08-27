@@ -17,7 +17,7 @@ AI collaborators: please read AGENTS.md for project-specific instructions, archi
 项目地址：[xiaosu19/QQ-Zone-Restore-Archive](https://github.com/xiaosu19/QQ-Zone-Restore-Archive)
 
 > [!IMPORTANT]
-> 本项目是基于 [Gaoshu705/QzoneArchive](https://github.com/Gaoshu705/QzoneArchive) 的 GPLv3 二次开发版本，并参考了 [LibraHp/GetQzonehistory](https://github.com/LibraHp/GetQzonehistory) 的互动列表与可见说说补齐思路。原项目作者、参考项目作者和腾讯公司均不对本分支提供背书或担保。
+> 本项目是基于 [Gaoshu705/QzoneArchive](https://github.com/Gaoshu705/QzoneArchive) 的 GPLv3 二次开发版本，并参考了 [LibraHp/GetQzonehistory](https://github.com/LibraHp/GetQzonehistory)、[salt-fishes/qzone-archiver](https://github.com/salt-fishes/qzone-archiver) 与 [Gu-Heping/onebot-qzone](https://github.com/Gu-Heping/onebot-qzone) 的历史通知、评论正文和昵称解析思路。原项目作者、参考项目作者和腾讯公司均不对本分支提供背书或担保。
 
 > [!WARNING]
 > 本项目不是腾讯、QQ 或 QQ 空间官方产品。所谓“恢复已删除说说”仅指：当已删除内容仍残留在点赞、评论、回复等互动记录中时，尝试还原其中可取得的正文和媒体信息；没有互动痕迹、已被服务端彻底清除、无权访问或接口不再返回的内容无法恢复，也不保证归档结果完整。请仅处理本人账号或已获得充分授权的内容，并自行承担账号限制、第三方接口变化、数据遗漏和本地数据保管风险。
@@ -35,6 +35,20 @@ AI collaborators: please read AGENTS.md for project-specific instructions, archi
 - **媒体时光轴**：按年份浏览归档的照片和视频，视频支持按需缓存
 - **暗色模式**：跟随系统或手动切换
 - **跨平台**：Windows / macOS / Linux 桌面端 + Android 移动端
+
+## v1.0.9 优化
+
+- 归档内容新增年份筛选与时间正序/倒序排列，概览中的“最近动态”默认展示最新记录
+- 联系人评论数支持点击查看按原说说归组的完整评论往来；评论者和回复者昵称悬停可查看 QQ 号
+- 历史消息改为参考 `GetQzonehistory` 的边界定位再完整回扫，探测上限为 offset 10,000,000，并在任务结果中显示估算边界与最深探测位置
+- 继续保留数据库稳定键去重、评论回复链合并、昵称补全及媒体过滤；无法从旧接口恢复的正文会明确标记，不伪造内容
+
+## v1.0.8 优化
+
+- 历史互动卡片新增评论正文解析，不再把仍存在于 `.comments-content` / `.comments-item` 中的原文替换为占位提示
+- 修正历史卡片操作者昵称的匹配规则，并通过 QQ 空间 GBK 昵称接口批量补全仅有 QQ 号的点赞者、评论者和联系人
+- 历史分页遇到偶发空响应时连续向后验证三页，避免单次空页导致归档提前结束；已有归档仍按稳定键去重合并
+- 评论展示优先使用补全后的联系人昵称，概览、联系人排行、点赞和评论统计继续直接从 SQLite 最新数据计算
 
 ## v1.0.7 优化
 
