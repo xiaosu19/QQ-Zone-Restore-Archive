@@ -3500,6 +3500,16 @@ fn html_escape(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+fn export_time_html(seconds: i64) -> String {
+    // Keep an explicit fallback even when scripts are disabled in the viewer.
+    // A zero value is missing source data, not a publication date in 1970.
+    if seconds <= 0 {
+        "<time>时间未知</time>".into()
+    } else {
+        format!("<time data-time=\"{seconds}\">时间未知</time>")
+    }
+}
+
 fn qzone_text_html(value: Option<&str>) -> String {
     let text = value
         .unwrap_or("")
@@ -3643,13 +3653,17 @@ pub async fn export_archived_html(
     if items.is_empty() {
         return Err("当前分类没有可以导出的归档".into());
     }
-    let category_name = match category.as_str() {
+    Ok(render_archive_html(&owner_uin, &category, &items))
+}
+
+fn render_archive_html(owner_uin: &str, category: &str, items: &[ArchiveItem]) -> String {
+    let category_name = match category {
         "self" => "本人动态",
         "other" => "其他动态",
         _ => "留言",
     };
     let mut cards = String::new();
-    for item in &items {
+    for item in items {
         let author = item
             .author_name
             .as_deref()
@@ -3668,9 +3682,8 @@ pub async fn export_archived_html(
             cards.push_str(&html_escape(author_uin));
             cards.push_str(" · ");
         }
-        cards.push_str("<time data-time=\"");
-        cards.push_str(&item.published_at.to_string());
-        cards.push_str("\"></time></small></div></header><div class=\"content\">");
+        cards.push_str(&export_time_html(item.published_at));
+        cards.push_str("</small></div></header><div class=\"content\">");
         cards.push_str(&qzone_text_html(item.content.as_deref()));
         cards.push_str("</div>");
         if !item.picture_urls.is_empty() {
@@ -3727,9 +3740,9 @@ pub async fn export_archived_html(
                     .unwrap_or("QQ 用户");
                 cards.push_str("<div class=\"comment\"><div class=\"comment-meta\"><b>");
                 cards.push_str(&html_escape(comment_name));
-                cards.push_str("</b> 评论于 <time data-time=\"");
-                cards.push_str(&comment.created_at.to_string());
-                cards.push_str("\"></time></div>");
+                cards.push_str("</b> 评论于 ");
+                cards.push_str(&export_time_html(comment.created_at));
+                cards.push_str("</div>");
                 cards.push_str(&qzone_text_html(Some(&comment.content)));
                 if !comment.replies.is_empty() {
                     cards.push_str("<div class=\"replies\">");
@@ -3749,9 +3762,9 @@ pub async fn export_archived_html(
                                 .or(reply.reply_to_uin.as_deref())
                                 .unwrap_or(comment_name),
                         ));
-                        cards.push_str(" · <time data-time=\"");
-                        cards.push_str(&reply.created_at.to_string());
-                        cards.push_str("\"></time></div>");
+                        cards.push_str(" · ");
+                        cards.push_str(&export_time_html(reply.created_at));
+                        cards.push_str("</div>");
                         cards.push_str(&qzone_text_html(Some(&reply.content)));
                         cards.push_str("</div>");
                     }
@@ -3763,11 +3776,12 @@ pub async fn export_archived_html(
         }
         cards.push_str("</article>");
     }
-    Ok(format!(
-        r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>QQ 空间恢复归档 - {category_name}</title><style>*{{box-sizing:border-box}}body{{margin:0;background:#f3f6fb;color:#243247;font:14px/1.7 system-ui,-apple-system,"Microsoft YaHei",sans-serif}}main{{width:min(820px,calc(100% - 24px));margin:30px auto}}h1{{margin:0}}.intro{{color:#758298;margin:0 0 20px}}.card{{background:#fff;border:1px solid #e5eaf2;border-radius:16px;padding:20px;margin:14px 0;box-shadow:0 8px 25px #2038580b}}header{{display:flex;gap:11px;align-items:center}}.avatar{{width:44px;height:44px;border-radius:50%}}header strong,header small{{display:block}}small,.muted,.stats{{color:#7e899a}}.content{{margin:14px 0;white-space:pre-wrap;overflow-wrap:anywhere}}.mention,a{{color:#2684ff}}.pictures{{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}}.pictures img{{display:block;width:100%;height:210px;object-fit:cover;border-radius:8px}}.video{{display:inline-block;padding:7px 12px;background:#edf5ff;border-radius:9px;text-decoration:none}}.stats{{margin-top:12px}}.comments{{margin-top:12px;padding:12px;background:#f6f8fb;border-radius:10px}}.comment{{margin:8px 0}}.comment-meta{{margin-bottom:3px;color:#7e899a;font-size:11px}}.comment-meta b{{color:#2684ff}}.replies{{margin:6px 0 0 18px;padding:7px 10px;border-left:2px solid #c9dcf6;background:#fff;border-radius:0 7px 7px 0}}@media(max-width:600px){{main{{margin:16px auto}}.card{{padding:15px}}.pictures img{{height:125px}}}}</style></head><body><main><h1>QQ 空间恢复归档 · {category_name}</h1><p class="intro">账号 {owner} · 共 {count} 条 · 导出时间 <span id="export-time"></span></p>{cards}</main><script>document.querySelector('#export-time').textContent=new Date().toLocaleString();document.querySelectorAll('time[data-time]').forEach(e=>e.textContent=new Date(Number(e.dataset.time)*1000).toLocaleString());</script></body></html>"#,
-        owner = html_escape(&owner_uin),
-        count = items.len()
-    ))
+    format!(
+        r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>QQ 空间恢复归档 - {category_name}</title><style>*{{box-sizing:border-box}}body{{margin:0;background:#f3f6fb;color:#243247;font:14px/1.7 system-ui,-apple-system,"Microsoft YaHei",sans-serif}}main{{width:min(820px,calc(100% - 24px));margin:30px auto}}h1{{margin:0}}.intro{{color:#758298;margin:0 0 20px}}.card{{background:#fff;border:1px solid #e5eaf2;border-radius:16px;padding:20px;margin:14px 0;box-shadow:0 8px 25px #2038580b}}header{{display:flex;gap:11px;align-items:center}}.avatar{{width:44px;height:44px;border-radius:50%}}header strong,header small{{display:block}}small,.muted,.stats{{color:#7e899a}}.content{{margin:14px 0;white-space:pre-wrap;overflow-wrap:anywhere}}.mention,a{{color:#2684ff}}.pictures{{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}}.pictures img{{display:block;width:100%;height:210px;object-fit:cover;border-radius:8px}}.video{{display:inline-block;padding:7px 12px;background:#edf5ff;border-radius:9px;text-decoration:none}}.stats{{margin-top:12px}}.comments{{margin-top:12px;padding:12px;background:#f6f8fb;border-radius:10px}}.comment{{margin:8px 0}}.comment-meta{{margin-bottom:3px;color:#7e899a;font-size:11px}}.comment-meta b{{color:#2684ff}}.replies{{margin:6px 0 0 18px;padding:7px 10px;border-left:2px solid #c9dcf6;background:#fff;border-radius:0 7px 7px 0}}@media(max-width:600px){{main{{margin:16px auto}}.card{{padding:15px}}.pictures img{{height:125px}}}}</style></head><body><main><h1>QQ 空间恢复归档 · {category_name}</h1><p class="intro">账号 {owner} · 共 {count} 条 · 导出时间 <span id="export-time"></span></p>{cards}</main><script>{time_script}</script></body></html>"#,
+        owner = html_escape(owner_uin),
+        count = items.len(),
+        time_script = include_str!("export-time.js"),
+    )
 }
 
 #[tauri::command]
@@ -4718,13 +4732,77 @@ pub async fn list_qzone_library_years(
 mod tests {
     use super::{
         advance_feed_cursor, archive_page_delay_ms, canonical_qzone_cell_id, checkpoint_is_stale,
-        comment_from_values, interaction_failure_can_finish, library_created_at, merge_comments,
-        migrate_history_guestbook_records, migrate_library_guestbook_timestamps, parse_feed,
-        parse_feed_cursor, serialize_query_pairs, skip_probe_offsets, video_cover_url, video_urls,
-        ArchiveCheckpoint, FeedCursorDetails,
+        comment_from_values, export_time_html, interaction_failure_can_finish, library_created_at,
+        merge_comments, migrate_history_guestbook_records, migrate_library_guestbook_timestamps,
+        parse_feed, parse_feed_cursor, render_archive_html, serialize_query_pairs,
+        skip_probe_offsets, video_cover_url, video_urls, ArchiveCheckpoint, ArchiveComment,
+        ArchiveItem, ArchiveReply, FeedCursorDetails,
     };
     use rusqlite::{params, Connection};
     use serde_json::json;
+
+    #[test]
+    fn exported_missing_times_are_explicitly_unknown() {
+        for seconds in [0, -1, i64::MIN] {
+            assert_eq!(export_time_html(seconds), "<time>时间未知</time>");
+        }
+        assert_eq!(
+            export_time_html(1_534_743_240),
+            "<time data-time=\"1534743240\">时间未知</time>"
+        );
+    }
+
+    #[test]
+    fn exported_posts_comments_and_replies_share_safe_time_rendering() {
+        // A deleted post can have an unknown publication date even when the
+        // surviving comment has a known time. Never substitute one for another.
+        let mut item = ArchiveItem {
+            owner_uin: "10001".into(),
+            id: 1,
+            cell_id: "history-v2:unknown".into(),
+            published_at: 0,
+            content: Some("历史说说 <script>不得执行</script>".into()),
+            author_uin: Some("10001".into()),
+            author_name: Some("测试用户".into()),
+            picture_urls: vec![],
+            video_url: None,
+            video_urls: vec![],
+            video_cover_url: None,
+            like_count: 0,
+            comment_count: 1,
+            likes: vec![],
+            comments: vec![ArchiveComment {
+                comment_id: None,
+                uin: None,
+                nickname: Some("评论用户".into()),
+                content: "评论正文".into(),
+                created_at: 1_574_686_320,
+                replies: vec![ArchiveReply {
+                    uin: None,
+                    nickname: None,
+                    reply_to_uin: None,
+                    reply_to_nickname: None,
+                    content: "回复正文".into(),
+                    created_at: 0,
+                }],
+            }],
+        };
+        for category in ["self", "other", "guestbook"] {
+            let html = render_archive_html("10001", category, std::slice::from_ref(&item));
+            assert_eq!(html.matches("<time>时间未知</time>").count(), 2);
+            assert!(html.contains("评论于 <time data-time=\"1574686320\">"));
+            assert!(!html.contains("data-time=\"0\""));
+            assert!(html.contains("&lt;script&gt;不得执行&lt;/script&gt;"));
+            assert!(html.contains(include_str!("export-time.js")));
+        }
+        item.published_at = 1_536_932_940;
+        item.comments[0].created_at = 0;
+        item.comments[0].replies[0].created_at = 1_574_686_380;
+        let html = render_archive_html("10001", "self", &[item]);
+        assert!(html.contains("<time data-time=\"1536932940\">"));
+        assert!(html.contains("评论于 <time>时间未知</time>"));
+        assert!(html.contains("<time data-time=\"1574686380\">"));
+    }
 
     #[test]
     fn waf_block_finishes_after_desktop_channels_even_without_saved_rows() {
