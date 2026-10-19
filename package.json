@@ -1,9 +1,10 @@
 {
   "name": "qzonearchive",
   "private": true,
-  "version": "1.1.1",
+  "version": "1.1.2",
   "type": "module",
   "scripts": {
+    "test": "node --test scripts/*.test.mjs",
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
